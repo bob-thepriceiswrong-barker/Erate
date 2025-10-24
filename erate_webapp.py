@@ -53,27 +53,33 @@ def fetch_form_471_data(limit=50000):
         # Calculate date 3 years ago
         three_years_ago = (datetime.now() - timedelta(days=1095)).year
         
-        # Fetch all data (API doesn't support filtering) - Updated for actual USAC API structure
-        response = requests.get(FORM_471_API_URL, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        df = pd.DataFrame(data)
-        
-        if len(df) == 0:
-            return pd.DataFrame()
-        
-        # Filter data locally since API doesn't support filtering
-        # Filter for Texas and last 3 years
-        if 'ros_physical_state' in df.columns:
-            df = df[df['ros_physical_state'] == 'TX']
-            print(f"Filtered to Texas: {len(df)} records")
-        
-        if 'funding_year' in df.columns:
-            df['funding_year'] = pd.to_numeric(df['funding_year'], errors='coerce')
-            df = df[df['funding_year'] >= three_years_ago]
-            print(f"Filtered to recent years (>= {three_years_ago}): {len(df)} records")
-        
+        # Fetch Texas data for last 3 years using SODA2 server-side filtering with pagination
+        texas_rows = []
+        batch_limit = min(limit, 50000)
+        current_year = datetime.now().year
+        years_to_fetch = list(range(three_years_ago, current_year + 1))
+
+        for year in years_to_fetch:
+            offset = 0
+            while True:
+                # Use simple SODA2 filtering on columns to avoid $where incompatibilities
+                params = {
+                    'ros_physical_state': 'TX',
+                    'funding_year': year,
+                    '$limit': batch_limit,
+                    '$offset': offset
+                }
+                resp = requests.get(FORM_471_API_URL, params=params, timeout=30)
+                resp.raise_for_status()
+                chunk = resp.json()
+                if not chunk:
+                    break
+                texas_rows.extend(chunk)
+                if len(chunk) < batch_limit:
+                    break
+                offset += batch_limit
+
+        df = pd.DataFrame(texas_rows)
         if len(df) == 0:
             return pd.DataFrame()
         
