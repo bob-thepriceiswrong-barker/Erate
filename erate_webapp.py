@@ -53,14 +53,8 @@ def fetch_form_471_data(limit=50000):
         # Calculate date 3 years ago
         three_years_ago = (datetime.now() - timedelta(days=1095)).year
         
-        # Fetch data with filters
-        params = {
-            '$limit': limit,
-            '$where': f"funding_year >= {three_years_ago} AND recipient_state = 'TX'",
-            '$order': 'funding_year DESC'
-        }
-        
-        response = requests.get(FORM_471_API_URL, params=params, timeout=30)
+        # Fetch all data (API doesn't support filtering) - Updated for actual USAC API structure
+        response = requests.get(FORM_471_API_URL, timeout=30)
         response.raise_for_status()
         
         data = response.json()
@@ -69,25 +63,36 @@ def fetch_form_471_data(limit=50000):
         if len(df) == 0:
             return pd.DataFrame()
         
-        # Standardize column names
+        # Filter data locally since API doesn't support filtering
+        # Filter for Texas and last 3 years
+        if 'ros_physical_state' in df.columns:
+            df = df[df['ros_physical_state'] == 'TX']
+            print(f"Filtered to Texas: {len(df)} records")
+        
+        if 'funding_year' in df.columns:
+            df['funding_year'] = pd.to_numeric(df['funding_year'], errors='coerce')
+            df = df[df['funding_year'] >= three_years_ago]
+            print(f"Filtered to recent years (>= {three_years_ago}): {len(df)} records")
+        
+        if len(df) == 0:
+            return pd.DataFrame()
+        
+        # Standardize column names - Updated for actual USAC API structure
         column_mapping = {
-            'recipient_name': 'Applicant_Name',
+            'ros_entity_name': 'Applicant_Name',
             'funding_year': 'Funding_Year',
-            'service_provider_name': 'Vendor',
-            'total_authorized_disbursement': 'Amount_Approved',
-            'category_of_service': 'Service_Category',
-            'purpose': 'Purpose',
-            'function_of_product_or_service': 'Function',
-            'manufacturer': 'Manufacturer',
-            'recipient_city': 'City',
-            'recipient_state': 'State',
+            'spin_name': 'Vendor',
+            'post_discount_extended_eligible_line_item_costs': 'Amount_Approved',
+            'chosen_category_of_service': 'Service_Category',
+            'form_471_function_name': 'Function',
+            'ros_physical_city': 'City',
+            'ros_physical_state': 'State',
             # Line-item details (Phase 5)
-            'product_or_service_name': 'Product_Name',
-            'model_number': 'Model_Number',
-            'quantity_of_eligible_units': 'Quantity',
-            'unit_cost': 'Unit_Cost',
-            'monthly_cost': 'Monthly_Cost',
-            'line_item_description': 'Description'
+            'form_471_product_name': 'Product_Name',
+            'monthly_quantity': 'Quantity',
+            'monthly_recurring_unit_eligible_costs': 'Unit_Cost',
+            'total_monthly_cost': 'Monthly_Cost',
+            'form_471_service_type_name': 'Service_Type'
         }
         
         # Rename columns that exist
