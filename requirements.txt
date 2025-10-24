@@ -1,7 +1,9 @@
 streamlit
 pandas
+openpyxl
 folium
 streamlit-folium
-openpyxl
 geopy
 requests
+fuzzywuzzy
+python-Levenshtein
