@@ -79,20 +79,30 @@ def fetch_form_471_data(limit=50000):
         
         # Standardize column names - Updated for actual USAC API structure
         column_mapping = {
+            # Existing mappings...
             'ros_entity_name': 'Applicant_Name',
+            'organization_name': 'Organization_Name',  # NEW - billed entity
             'funding_year': 'Funding_Year',
             'spin_name': 'Vendor',
             'post_discount_extended_eligible_line_item_costs': 'Amount_Approved',
             'chosen_category_of_service': 'Service_Category',
             'form_471_function_name': 'Function',
+            'form_471_service_type_name': 'Service_Type',
+            'form_471_product_name': 'Product_Name',
+            
+            # NEW Cost fields you requested:
+            'total_eligible_recurring_costs': 'FRN_Line_Eligible_Recurring_Costs',
+            'total_eligible_one_time_costs': 'FRN_Line_One_Time_Cost',
+            'one_time_eligible_costs': 'FRN_Line_One_Time_Eligible_Unit_Cost',
+            'one_time_quantity': 'FRN_Line_One_Time_Quantity',
+            'pre_discount_extended_eligible_line_item_costs': 'FRN_Line_Total_Pre_Discount_Cost',
+            
+            # Existing location/quantity fields...
             'ros_physical_city': 'City',
             'ros_physical_state': 'State',
-            # Line-item details (Phase 5)
-            'form_471_product_name': 'Product_Name',
             'monthly_quantity': 'Quantity',
             'monthly_recurring_unit_eligible_costs': 'Unit_Cost',
-            'total_monthly_cost': 'Monthly_Cost',
-            'form_471_service_type_name': 'Service_Type'
+            'total_monthly_cost': 'Monthly_Cost'
         }
         
         # Rename columns that exist
@@ -114,6 +124,13 @@ def fetch_form_471_data(limit=50000):
         if 'Funding_Year' in df.columns:
             df['Funding_Year'] = pd.to_numeric(df['Funding_Year'], errors='coerce').astype('Int64')
         
+        # Convert new cost fields to numeric
+        for cost_field in ['FRN_Line_Eligible_Recurring_Costs', 'FRN_Line_One_Time_Cost', 
+                           'FRN_Line_One_Time_Eligible_Unit_Cost', 'FRN_Line_One_Time_Quantity',
+                           'FRN_Line_Total_Pre_Discount_Cost']:
+            if cost_field in df.columns:
+                df[cost_field] = pd.to_numeric(df[cost_field], errors='coerce')
+        
         return df
         
     except Exception as e:
@@ -123,23 +140,47 @@ def fetch_form_471_data(limit=50000):
 def fuzzy_match_applicant(form_470_name, form_471_df, threshold=85):
     """
     Fuzzy match applicant names between Form 470 and Form 471
-    Returns matching records from Form 471
+    Tries matching both ros_entity_name (school) and organization_name (district)
     """
-    if form_471_df.empty or 'Applicant_Name' not in form_471_df.columns:
+    if form_471_df.empty:
         return pd.DataFrame()
     
-    # Try exact match first
-    exact_matches = form_471_df[form_471_df['Applicant_Name'].str.lower() == form_470_name.lower()]
-    if len(exact_matches) > 0:
-        return exact_matches
+    all_matches = pd.DataFrame()
     
-    # Try fuzzy matching
-    form_471_df['match_score'] = form_471_df['Applicant_Name'].apply(
-        lambda x: fuzz.ratio(str(x).lower(), form_470_name.lower())
-    )
+    # Try matching on Applicant_Name (ros_entity_name - the school)
+    if 'Applicant_Name' in form_471_df.columns:
+        # Exact match
+        exact = form_471_df[form_471_df['Applicant_Name'].str.lower() == form_470_name.lower()]
+        if len(exact) > 0:
+            all_matches = pd.concat([all_matches, exact])
+        
+        # Fuzzy match
+        form_471_df['match_score'] = form_471_df['Applicant_Name'].apply(
+            lambda x: fuzz.ratio(str(x).lower(), form_470_name.lower())
+        )
+        fuzzy = form_471_df[form_471_df['match_score'] >= threshold]
+        all_matches = pd.concat([all_matches, fuzzy])
     
-    matches = form_471_df[form_471_df['match_score'] >= threshold]
-    return matches.drop('match_score', axis=1)
+    # Also try matching on Organization_Name (organization_name - the billed entity/district)
+    if 'Organization_Name' in form_471_df.columns:
+        # Exact match
+        exact = form_471_df[form_471_df['Organization_Name'].str.lower() == form_470_name.lower()]
+        if len(exact) > 0:
+            all_matches = pd.concat([all_matches, exact])
+        
+        # Fuzzy match
+        form_471_df['org_match_score'] = form_471_df['Organization_Name'].apply(
+            lambda x: fuzz.ratio(str(x).lower(), form_470_name.lower())
+        )
+        fuzzy = form_471_df[form_471_df['org_match_score'] >= threshold]
+        all_matches = pd.concat([all_matches, fuzzy])
+    
+    # Remove duplicates and scoring columns
+    if not all_matches.empty:
+        all_matches = all_matches.drop_duplicates()
+        all_matches = all_matches.drop(columns=['match_score', 'org_match_score'], errors='ignore')
+    
+    return all_matches
 
 # ============================================================================
 # LINE-ITEM DRILL-DOWN (PHASE 5)
@@ -411,7 +452,7 @@ def construct_form_470_url(app_number, funding_year=2025):
     if pd.isna(app_number):
         return None
     app_num = int(app_number)
-    return f"https://data.usac.org/publicreports/Forms/Form470Rfp/Index?FundingYear={funding_year}&ApplicationNumber={app_num}"
+    return f"http://legacy.fundsforlearning.com/470/{app_num}"
 
 def matches_filter(value, filter_list):
     """Check if value matches any filter term"""
