@@ -36,7 +36,9 @@ LAT_WACO = 31.55
 LON_I35E = -97.0
 GEOCODE_CACHE_FILE = 'geocode_cache.csv'
 FORM_471_CACHE_FILE = 'form_471_cache.json'
-FORM_471_API_URL = 'https://opendata.usac.org/resource/avi8-svp9.json'
+FORM_471_API_URL = 'https://opendata.usac.org/resource/qdmp-ygft.json'
+# Optional: Form 470 dataset (beta). You can override via env var USAC_470_DATASET_URL
+FORM_470_API_URL = os.getenv('USAC_470_DATASET_URL', 'https://opendata.usac.org/resource/jp7a-89nd.json')
 CACHE_EXPIRY_DAYS = 7  # Refresh Form 471 cache weekly
 
 # ============================================================================
@@ -44,103 +46,171 @@ CACHE_EXPIRY_DAYS = 7  # Refresh Form 471 cache weekly
 # ============================================================================
 
 @st.cache_data(ttl=604800)  # Cache for 1 week
-def fetch_form_471_data(limit=50000):
+def fetch_form_471_data(limit=50000, years_back=3, state="TX"):
     """
-    Fetch Form 471 purchase history from USAC API
-    Returns last 3 years of data for competitive intelligence
+    Fetch Form 471 purchase history from USAC SODA qdmp-ygft dataset
+    - Server-side filter by state and funding year
+    - Pagination to gather more than SODA default page size
+    - Standardize columns for downstream logic
     """
     try:
-        # Calculate date 3 years ago
-        three_years_ago = (datetime.now() - timedelta(days=1095)).year
-        
-        # Fetch Texas data for last 3 years using SODA2 server-side filtering with pagination
-        texas_rows = []
-        batch_limit = min(limit, 50000)
         current_year = datetime.now().year
-        years_to_fetch = list(range(three_years_ago, current_year + 1))
+        start_year = current_year - years_back
+        headers = {}
+        # Optional: use a SODA App Token if available to improve rate limits
+        app_token = os.getenv("USAC_APP_TOKEN")
+        if app_token:
+            headers["X-App-Token"] = app_token
 
-        for year in years_to_fetch:
+        page_size = min(limit, 50000)
+        rows = []
+
+        # Fetch by year with pagination
+        for year in range(start_year, current_year + 1):
             offset = 0
             while True:
-                # Use simple SODA2 filtering on columns to avoid $where incompatibilities
                 params = {
-                    'ros_physical_state': 'TX',
-                    'funding_year': year,
-                    '$limit': batch_limit,
-                    '$offset': offset
+                    "state": state,
+                    "funding_year": year,
+                    "$select": ",".join([
+                        "organization_name",
+                        "funding_year",
+                        "spin_name",
+                        "total_authorized_disbursement",
+                        "form_471_service_type_name",
+                    ]),
+                    "$limit": page_size,
+                    "$offset": offset,
                 }
-                resp = requests.get(FORM_471_API_URL, params=params, timeout=30)
+                resp = requests.get(FORM_471_API_URL, params=params, headers=headers, timeout=30)
                 resp.raise_for_status()
                 chunk = resp.json()
                 if not chunk:
                     break
-                texas_rows.extend(chunk)
-                if len(chunk) < batch_limit:
+                rows.extend(chunk)
+                if len(chunk) < page_size:
                     break
-                offset += batch_limit
+                offset += page_size
 
-        df = pd.DataFrame(texas_rows)
+        df = pd.DataFrame(rows)
         if len(df) == 0:
             return pd.DataFrame()
-        
-        # Standardize column names - Updated for actual USAC API structure
+
+        # Standardize columns
         column_mapping = {
-            # Existing mappings...
-            'ros_entity_name': 'Applicant_Name',
-            'organization_name': 'Organization_Name',  # NEW - billed entity
-            'funding_year': 'Funding_Year',
-            'spin_name': 'Vendor',
-            'post_discount_extended_eligible_line_item_costs': 'Amount_Approved',
-            'chosen_category_of_service': 'Service_Category',
-            'form_471_function_name': 'Function',
-            'form_471_service_type_name': 'Service_Type',
-            'form_471_product_name': 'Product_Name',
-            
-            # NEW Cost fields you requested:
-            'total_eligible_recurring_costs': 'FRN_Line_Eligible_Recurring_Costs',
-            'total_eligible_one_time_costs': 'FRN_Line_One_Time_Cost',
-            'one_time_eligible_costs': 'FRN_Line_One_Time_Eligible_Unit_Cost',
-            'one_time_quantity': 'FRN_Line_One_Time_Quantity',
-            'pre_discount_extended_eligible_line_item_costs': 'FRN_Line_Total_Pre_Discount_Cost',
-            
-            # Existing location/quantity fields...
-            'ros_physical_city': 'City',
-            'ros_physical_state': 'State',
-            'monthly_quantity': 'Quantity',
-            'monthly_recurring_unit_eligible_costs': 'Unit_Cost',
-            'total_monthly_cost': 'Monthly_Cost'
+            "organization_name": "Applicant_Name",
+            "funding_year": "Funding_Year",
+            "spin_name": "Vendor",
+            "total_authorized_disbursement": "Amount_Approved",
+            "form_471_service_type_name": "Service_Category",
         }
-        
-        # Rename columns that exist
         df = df.rename(columns={k: v for k, v in column_mapping.items() if k in df.columns})
-        
-        # Convert amount to numeric
-        if 'Amount_Approved' in df.columns:
-            df['Amount_Approved'] = pd.to_numeric(df['Amount_Approved'], errors='coerce')
-        
-        # Convert line-item numeric fields (Phase 5)
-        if 'Quantity' in df.columns:
-            df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce')
-        if 'Unit_Cost' in df.columns:
-            df['Unit_Cost'] = pd.to_numeric(df['Unit_Cost'], errors='coerce')
-        if 'Monthly_Cost' in df.columns:
-            df['Monthly_Cost'] = pd.to_numeric(df['Monthly_Cost'], errors='coerce')
-        
-        # Convert funding year to int
-        if 'Funding_Year' in df.columns:
-            df['Funding_Year'] = pd.to_numeric(df['Funding_Year'], errors='coerce').astype('Int64')
-        
-        # Convert new cost fields to numeric
-        for cost_field in ['FRN_Line_Eligible_Recurring_Costs', 'FRN_Line_One_Time_Cost', 
-                           'FRN_Line_One_Time_Eligible_Unit_Cost', 'FRN_Line_One_Time_Quantity',
-                           'FRN_Line_Total_Pre_Discount_Cost']:
-            if cost_field in df.columns:
-                df[cost_field] = pd.to_numeric(df[cost_field], errors='coerce')
-        
+
+        # Convert numeric fields
+        if "Amount_Approved" in df.columns:
+            df["Amount_Approved"] = pd.to_numeric(df["Amount_Approved"], errors="coerce")
+        if "Funding_Year" in df.columns:
+            df["Funding_Year"] = pd.to_numeric(df["Funding_Year"], errors="coerce").astype("Int64")
+
         return df
-        
+
     except Exception as e:
         st.warning(f"Could not fetch Form 471 data: {str(e)}")
+        return pd.DataFrame()
+
+# ==========================================================================
+# FORM 470 API (BETA) - OPTIONAL SOURCE WHEN NO EXCEL IS PROVIDED
+# ==========================================================================
+
+@st.cache_data(ttl=604800)
+def fetch_form_470_api_data(limit=50000, years_back=3, state="TX"):
+    """
+    Fetch Form 470 summary data from USAC SODA dataset for recent years and a state.
+    Note: This dataset typically lacks detailed Function/Manufacturer fields
+    available in Funds for Learning exports. We synthesize minimal columns
+    to keep the downstream pipeline working.
+    """
+    try:
+        current_year = datetime.now().year
+        start_year = current_year - years_back
+        headers = {}
+        app_token = os.getenv("USAC_APP_TOKEN")
+        if app_token:
+            headers["X-App-Token"] = app_token
+
+        page_size = min(limit, 50000)
+        rows = []
+
+        # Pull per year with server-side filters
+        for year in range(start_year, current_year + 1):
+            offset = 0
+            while True:
+                params = {
+                    "$limit": page_size,
+                    "$offset": offset,
+                    "$select": ",".join([
+                        "billed_entity_name",
+                        "billed_entity_city",
+                        "billed_entity_state",
+                        "application_number",
+                        "funding_year",
+                        "category_one_description",
+                        "category_two_description"
+                    ]),
+                    "billed_entity_state": state,
+                    "funding_year": year,
+                }
+                resp = requests.get(FORM_470_API_URL, params=params, headers=headers, timeout=30)
+                if resp.status_code >= 400:
+                    break
+                chunk = resp.json()
+                if not chunk:
+                    break
+                rows.extend(chunk)
+                if len(chunk) < page_size:
+                    break
+                offset += page_size
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame()
+
+        # Build output rows; explode per service category present
+        output_rows = []
+        for _, r in df.iterrows():
+            name = r.get("billed_entity_name") or "Unknown"
+            city = r.get("billed_entity_city") or ""
+            st_code = r.get("billed_entity_state") or state
+            app_no = r.get("application_number")
+            c1 = r.get("category_one_description")
+            c2 = r.get("category_two_description")
+
+            service_types = []
+            if isinstance(c2, str) and c2.strip():
+                service_types.append("Internal Connections")
+            if isinstance(c1, str) and c1.strip():
+                service_types.append("Data Transmission and/or Internet Access")
+            if not service_types:
+                service_types.append("Unknown")
+
+            for stype in service_types:
+                output_rows.append({
+                    "Name of Applicant": name,
+                    "City": city,
+                    "State": st_code,
+                    "470 App Number": app_no,
+                    "Service Type": stype,
+                    "Function": "",
+                    "Manufacturer": "",
+                })
+
+        out = pd.DataFrame(output_rows)
+        if out.empty:
+            return out
+        return out.dropna(subset=["Name of Applicant"]).drop_duplicates()
+
+    except Exception as e:
+        st.warning(f"Could not fetch Form 470 API data: {str(e)}")
         return pd.DataFrame()
 
 def fuzzy_match_applicant(form_470_name, form_471_df, threshold=85):
@@ -498,6 +568,8 @@ def apply_filters(df, function_filters, manufacturer_filters):
     if not function_filters and not manufacturer_filters:
         return df
     
+    if 'Name of Applicant' not in df.columns:
+        return df
     applicant_groups = df.groupby('Name of Applicant')
     filtered_applicants = []
     
@@ -505,12 +577,18 @@ def apply_filters(df, function_filters, manufacturer_filters):
         # Check function filter
         function_match = True
         if function_filters:
-            function_match = group['Function'].apply(lambda x: matches_filter(x, function_filters)).any()
+            if 'Function' in group.columns:
+                function_match = group['Function'].apply(lambda x: matches_filter(x, function_filters)).any()
+            else:
+                function_match = False
         
         # Check manufacturer filter
         manufacturer_match = True
         if manufacturer_filters:
-            manufacturer_match = group['Manufacturer'].apply(lambda x: matches_filter(x, manufacturer_filters)).any()
+            if 'Manufacturer' in group.columns:
+                manufacturer_match = group['Manufacturer'].apply(lambda x: matches_filter(x, manufacturer_filters)).any()
+            else:
+                manufacturer_match = False
         
         if function_match and manufacturer_match:
             filtered_applicants.append(applicant_name)
@@ -521,21 +599,26 @@ def aggregate_by_applicant(df):
     """Aggregate line items by applicant"""
     aggregated_data = []
     
+    if 'Name of Applicant' not in df.columns:
+        return pd.DataFrame()
     for applicant_name, group in df.groupby('Name of Applicant'):
-        city = group['City'].iloc[0]
-        state = group['State'].iloc[0]
+        city = group['City'].iloc[0] if 'City' in group.columns else ''
+        state = group['State'].iloc[0] if 'State' in group.columns else ''
         
-        service_counts = group['Service Type'].value_counts().to_dict()
+        if 'Service Type' in group.columns:
+            service_counts = group['Service Type'].value_counts().to_dict()
+        else:
+            service_counts = {}
         ic_count = service_counts.get('Internal Connections', 0)
         bm_count = service_counts.get('Basic Maintenance of Internal Connections', 0)
         mb_count = service_counts.get('Managed Internal Broadband Services', 0)
         dia_count = service_counts.get('Data Transmission and/or Internet Access', 0)
         
-        app_number = group['470 App Number'].iloc[0]
+        app_number = group['470 App Number'].iloc[0] if '470 App Number' in group.columns else None
         form_url = construct_form_470_url(app_number)
         
-        functions = group['Function'].dropna().unique().tolist()
-        manufacturers = group['Manufacturer'].dropna().unique().tolist()
+        functions = group['Function'].dropna().unique().tolist() if 'Function' in group.columns else []
+        manufacturers = group['Manufacturer'].dropna().unique().tolist() if 'Manufacturer' in group.columns else []
         
         functions_str = ', '.join([str(f) for f in functions if f]) if functions else ''
         manufacturers_str = ', '.join([str(m) for m in manufacturers if m]) if manufacturers else ''
@@ -768,11 +851,18 @@ def main():
     # Sidebar - File Upload and Filters
     with st.sidebar:
         st.header("📁 Upload Data")
-        uploaded_file = st.file_uploader(
-            "Upload E-Rate Excel File",
-            type=['xls', 'xlsx'],
-            help="Upload your Funds for Learning export file"
+        source_choice = st.radio(
+            "Form 470 Data Source",
+            options=["Upload Excel (recommended)", "USAC 470 API (beta)"],
+            help="Use your Funds for Learning export or fetch basic 470s from USAC API"
         )
+        uploaded_file = None
+        if source_choice == "Upload Excel (recommended)":
+            uploaded_file = st.file_uploader(
+                "Upload E-Rate Excel File",
+                type=['xls', 'xlsx'],
+                help="Upload your Funds for Learning export file"
+            )
         
         st.markdown("---")
         st.header("🔍 Form 470 Filters")
@@ -845,8 +935,8 @@ def main():
         analyze_button = st.button("🚀 Analyze Opportunities", type="primary", use_container_width=True)
     
     # Main content area
-    if uploaded_file is None:
-        st.info("👈 Please upload an E-Rate Excel file to get started")
+    if source_choice == "Upload Excel (recommended)" and uploaded_file is None:
+        st.info("👈 Please upload an E-Rate Excel file to get started, or switch to 'USAC 470 API (beta)' to run without a file.")
         
         # Show instructions
         with st.expander("📖 How to Use This Tool - Intelligence Edition"):
@@ -913,12 +1003,18 @@ def main():
                 else:
                     st.success(f"✅ Loaded {len(form_471_df):,} purchase records from last 3 years")
                 
-                # Step 2: Load Form 470 data
+                # Step 2: Load Form 470 data (Excel or USAC 470 API)
                 st.info("📁 Step 2/4: Processing Form 470 data...")
-                df = load_data(uploaded_file)
+                if source_choice == "Upload Excel (recommended)":
+                    df = load_data(uploaded_file)
+                else:
+                    df = fetch_form_470_api_data()
                 
                 # Filter to Texas
-                texas_df = df[df['State'] == 'TX'].copy()
+                if 'State' in df.columns:
+                    texas_df = df[df['State'] == 'TX'].copy()
+                else:
+                    texas_df = df.copy()
                 
                 if len(texas_df) == 0:
                     st.error("No Texas applicants found in the uploaded file!")
