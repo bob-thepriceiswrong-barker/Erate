@@ -168,56 +168,143 @@ def save_cache(cache: pd.DataFrame) -> None:
     cache.to_csv(GEOCODE_CACHE_FILE, index=False)
 
 
+# --- Add near your constants ---
+STATE_BBOX = {
+    "TX": {"minlon": -106.65, "minlat": 25.84, "maxlon": -93.51, "maxlat": 36.50},
+    "OK": {"minlon": -103.00, "minlat": 33.62, "maxlon": -94.43, "maxlat": 37.00},
+}
+
+def _point_in_box(lat: float, lon: float, bbox: dict) -> bool:
+    return (
+        bbox["minlat"] <= lat <= bbox["maxlat"] and
+        bbox["minlon"] <= lon <= bbox["maxlon"]
+    )
+
+def _census_geocode_city_state(city: str, state: str) -> tuple | None:
+    """
+    Fallback. Uses U.S. Census Geocoder for 'City, State'.
+    Returns (lat, lon) or None.
+    """
+    try:
+        url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+        params = {
+            "address": f"{city}, {state}, USA",
+            "benchmark": "Public_AR_Current",
+            "format": "json",
+        }
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        matches = j.get("result", {}).get("addressMatches", [])
+        if not matches:
+            return None
+        coords = matches[0].get("coordinates", {})
+        lon = coords.get("x")
+        lat = coords.get("y")
+        if lat is None or lon is None:
+            return None
+        return (lat, lon)
+    except Exception:
+        return None
+
 @st.cache_data(ttl=86400)
 def geocode_bulk(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Geocode by City + State, cache to CSV, rate-limited for Nominatim.
+    Geocode by City + State with strict TX/OK bounding.
+    1) Nominatim with viewbox bounded to the state.
+    2) If out-of-bounds or missing, fallback to U.S. Census Geocoder.
+    3) Cache results to CSV keyed by (Name, City, State).
     """
     cache = load_cache()
-    geolocator = Nominatim(user_agent="erate_geo_cache")
+    geolocator = Nominatim(user_agent="erate_geo_cache_tx_ok")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
-    # Join existing cached coordinates
-    merged = df.merge(cache, how="left", left_on=["Name of Applicant", "City", "State"],
-                      right_on=["Name", "City", "State"])
+    merged = df.merge(
+        cache,
+        how="left",
+        left_on=["Name of Applicant", "City", "State"],
+        right_on=["Name", "City", "State"]
+    )
 
-    # Identify which need geocoding
     needs = merged[merged["Latitude"].isna() | merged["Longitude"].isna()].copy()
-
     progress = st.progress(0.0)
     total = max(1, len(needs))
     done = 0
 
     for idx, row in needs.iterrows():
-        query = f"{row['City']}, {row['State']}"
+        city = str(row["City"]).strip()
+        state = str(row["State"]).strip().upper()
+
+        # Only handle TX and OK; skip others
+        bbox = STATE_BBOX.get(state)
+        lat, lon = None, None
+
+        # Try Nominatim with state-bounded viewbox first
         try:
-            loc = geocode(query)
+            if bbox:
+                viewbox = [
+                    [bbox["minlat"], bbox["minlon"]],
+                    [bbox["maxlat"], bbox["maxlon"]],
+                ]
+                # Nominatim expects [minlon, minlat, maxlon, maxlat] as a flat list
+                flat_viewbox = [bbox["minlon"], bbox["minlat"], bbox["maxlon"], bbox["maxlat"]]
+                loc = geocode(
+                    f"{city}, {state}, USA",
+                    country_codes="us",
+                    viewbox=flat_viewbox,
+                    bounded=True,
+                    addressdetails=False,
+                    exactly_one=True,
+                )
+            else:
+                loc = geocode(f"{city}, {state}, USA", country_codes="us", exactly_one=True)
         except Exception:
             loc = None
+
         if loc:
-            merged.at[idx, "Latitude"] = loc.latitude
-            merged.at[idx, "Longitude"] = loc.longitude
-            # write-through cache row by row
-            cache = pd.concat([cache, pd.DataFrame([{
-                "Name": row["Name of Applicant"],
-                "City": row["City"],
-                "State": row["State"],
-                "Latitude": loc.latitude,
-                "Longitude": loc.longitude
-            }])], ignore_index=True)
+            lat, lon = loc.latitude, loc.longitude
+            if bbox and not _point_in_box(lat, lon, bbox):
+                # Out of state bounds; discard
+                lat, lon = None, None
+
+        # Fallback: Census geocoder
+        if (lat is None or lon is None) and bbox:
+            alt = _census_geocode_city_state(city, state)
+            if alt:
+                lat, lon = alt
+                if not _point_in_box(lat, lon, bbox):
+                    lat, lon = None, None  # still wrong, discard
+
+        # Save if we found a good point
+        if lat is not None and lon is not None:
+            merged.at[idx, "Latitude"] = lat
+            merged.at[idx, "Longitude"] = lon
+            cache = pd.concat(
+                [
+                    cache,
+                    pd.DataFrame([{
+                        "Name": row["Name of Applicant"],
+                        "City": city,
+                        "State": state,
+                        "Latitude": lat,
+                        "Longitude": lon,
+                    }]),
+                ],
+                ignore_index=True,
+            )
+
         done += 1
         progress.progress(min(1.0, done / total))
-        time.sleep(0.1)
+        time.sleep(0.05)
 
-    # Save cache after batch
+    # Persist cache
     if len(cache):
         cache = cache.drop_duplicates(subset=["Name", "City", "State"], keep="last")
         save_cache(cache)
 
-    # Drop helper columns
     merged = merged.drop(columns=["Name"], errors="ignore")
     return merged
-
 
 def color_for_service_counts(ic: int, bmic: int, mibs: int) -> str:
     only_ic = ic > 0 and bmic == 0 and mibs == 0
