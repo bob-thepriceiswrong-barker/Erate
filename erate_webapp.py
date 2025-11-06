@@ -1,65 +1,268 @@
 """
-Texas E-Rate Form 470 Analyzer - 470-Only Version (No Form 471)
+E-Rate Opportunity Finder (TX + OK) — Category 2 Focused
+
+Features
+- Upload Funds For Learning Excel 470 export OR use USAC API fallback
+- Filters to Category 2 only: IC, BMIC, MIBS (C1 ignored if present)
+- Dynamic manufacturer and function filters (includes Palo Alto Networks)
+- Geographic filters: TX north of Waco, west of I-35E, and ALL Oklahoma
+- Cached geocoding to CSV
+- Color-coded map: IC=blue, BMIC=green, MIBS=purple, Mixed=dark red
+- Excel export of results
 """
 
-import streamlit as st
+import os
+import time
+from io import BytesIO
+from datetime import datetime
+from typing import List, Tuple, Dict, Optional
+
 import pandas as pd
+import requests
+import streamlit as st
 import folium
 from streamlit_folium import folium_static
 from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
-import time
-import os
-from io import BytesIO
-import requests
-from datetime import datetime, timedelta
+from geopy.extra.rate_limiter import RateLimiter
 
-# ============================================================================
-# PAGE CONFIG
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# Page config
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="E-Rate Opportunity Finder - 470 Only",
+    page_title="E-Rate Opportunity Finder — TX/OK (C2)",
     page_icon="📄",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+LAT_WACO = 31.55         # keep rows north of this latitude in TX
+LON_I35E = -97.0         # keep rows west of this longitude in TX
+GEOCODE_CACHE_FILE = "geocode_cache.csv"
+USAC_470_URL = os.getenv("USAC_470_DATASET_URL", "https://opendata.usac.org/resource/jp7a-89nd.json")
 
-LAT_WACO = 31.55
-LON_I35E = -97.0
-GEOCODE_CACHE_FILE = 'geocode_cache.csv'
-FORM_470_API_URL = os.getenv('USAC_470_DATASET_URL', 'https://opendata.usac.org/resource/jp7a-89nd.json')
+# If you have a SODA app token, add it to env or .streamlit/secrets.toml as USAC_APP_TOKEN
+USAC_APP_TOKEN = os.getenv("USAC_APP_TOKEN", st.secrets.get("USAC_APP_TOKEN", None))
 
-# ============================================================================
-# FORM 470 API (USAC SODA)
-# ============================================================================
+# Heuristics for parsing wide FFL Excel extracts
+C2_FUNCTION_KEYWORDS = {
+    "ic": [
+        "access point", "ap", "wireless", "wifi", "wi-fi", "switch", "switches",
+        "router", "firewall", "controller", "ups", "battery", "cabling", "transceiver",
+        "sfp", "optics", "antenna"
+    ],
+    "bmic": [
+        "basic maintenance", "maintenance", "support contract"
+    ],
+    "mibs": [
+        "managed internal broadband", "mibs", "managed service", "as-a-service", "aas"
+    ]
+}
 
-@st.cache_data(ttl=604800)
-def fetch_form_470_api_data(limit=50000, years_back=3, state="TX"):
+# Common manufacturers to detect as dynamic options. We will still scan all columns.
+COMMON_MANUFACTURERS = [
+    "Palo Alto", "Palo Alto Networks", "Cisco", "Meraki", "Aruba", "HPE", "HPE Aruba",
+    "Fortinet", "Juniper", "Ruckus", "Ubiquiti", "Extreme", "Brocade", "Arista",
+    "Cambium", "Aerohive", "Hikvision", "Mellanox", "TP-Link", "HPE ProCurve"
+]
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def normalize_str(x: Optional[str]) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+
+def any_keyword_in_text(text: str, keywords: List[str]) -> bool:
+    t = text.lower()
+    return any(k.lower() in t for k in keywords)
+
+
+def is_truthy_cell(val) -> bool:
+    """Interpret Excel one-hot or boolean-ish cells as True/False."""
+    if pd.isna(val):
+        return False
+    s = str(val).strip().lower()
+    return s in {"true", "yes", "y", "1", "x", "✓", "t"}
+
+
+def find_columns(df: pd.DataFrame, needles: List[str]) -> List[str]:
+    """Return all columns whose header contains any of the given needle strings (case-insensitive)."""
+    cols = []
+    for c in df.columns:
+        c_low = str(c).lower()
+        if any(n.lower() in c_low for n in needles):
+            cols.append(c)
+    return cols
+
+
+def detect_c2_subtypes_from_row(row: pd.Series, func_cols: Dict[str, List[str]]) -> Tuple[bool, bool, bool]:
     """
-    Fetch Form 470 summary data from USAC SODA dataset for recent years and a state.
-    Maps to the app's expected columns for downstream processing.
+    From a wide Excel row with many one-hot columns, decide which C2 subtypes are present.
+    Priority: direct keyword columns if present; else fall back to function text scan.
     """
+    ic_cols = func_cols.get("ic", [])
+    bmic_cols = func_cols.get("bmic", [])
+    mibs_cols = func_cols.get("mibs", [])
+
+    ic = any(is_truthy_cell(row.get(c)) for c in ic_cols)
+    bmic = any(is_truthy_cell(row.get(c)) for c in bmic_cols)
+    mibs = any(is_truthy_cell(row.get(c)) for c in mibs_cols)
+
+    # Backstop: scan any "Function" or wide text blob columns if none matched yet
+    if not (ic or bmic or mibs):
+        text_blob = " ".join([
+            normalize_str(row.get("Function")),
+            normalize_str(row.get("Functions")),
+            normalize_str(row.get("Service Type")),
+            " ".join([normalize_str(row.get(c)) for c in row.index if isinstance(row.get(c), str)])
+        ])
+        ic = any_keyword_in_text(text_blob, C2_FUNCTION_KEYWORDS["ic"])
+        bmic = any_keyword_in_text(text_blob, C2_FUNCTION_KEYWORDS["bmic"])
+        mibs = any_keyword_in_text(text_blob, C2_FUNCTION_KEYWORDS["mibs"])
+
+    return ic, bmic, mibs
+
+
+def extract_manufacturers_from_row(row: pd.Series, mfr_cols: List[str]) -> List[str]:
+    found = []
+    for c in mfr_cols:
+        v = row.get(c)
+        if is_truthy_cell(v):
+            # Try to clean header to manufacturer name
+            name = str(c)
+            # Remove common Excel artifacts like ".1", quotes, brackets
+            name = name.replace(".1", "").replace("'", "").strip()
+            found.append(name)
+    # Deduplicate and normalize some canonical names
+    norm = []
+    for m in found:
+        mm = m
+        if mm.lower().startswith("palo alto"):
+            mm = "Palo Alto Networks"
+        elif mm.lower() == "extreme networks" or mm.lower().startswith("extreme"):
+            mm = "Extreme Networks"
+        elif mm.lower().startswith("aruba"):
+            mm = "Aruba"
+        elif mm.lower().startswith("cisco meraki") or mm.lower() == "meraki":
+            mm = "Meraki"
+        norm.append(mm)
+    return sorted(set(norm))
+
+
+def load_cache() -> pd.DataFrame:
+    if os.path.exists(GEOCODE_CACHE_FILE):
+        try:
+            return pd.read_csv(GEOCODE_CACHE_FILE)
+        except Exception:
+            return pd.DataFrame(columns=["Name", "City", "State", "Latitude", "Longitude"])
+    return pd.DataFrame(columns=["Name", "City", "State", "Latitude", "Longitude"])
+
+
+def save_cache(cache: pd.DataFrame) -> None:
+    cache.to_csv(GEOCODE_CACHE_FILE, index=False)
+
+
+@st.cache_data(ttl=86400)
+def geocode_bulk(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Geocode by City + State, cache to CSV, rate-limited for Nominatim.
+    """
+    cache = load_cache()
+    geolocator = Nominatim(user_agent="erate_geo_cache")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+
+    # Join existing cached coordinates
+    merged = df.merge(cache, how="left", left_on=["Name of Applicant", "City", "State"],
+                      right_on=["Name", "City", "State"])
+
+    # Identify which need geocoding
+    needs = merged[merged["Latitude"].isna() | merged["Longitude"].isna()].copy()
+
+    progress = st.progress(0.0)
+    total = max(1, len(needs))
+    done = 0
+
+    for idx, row in needs.iterrows():
+        query = f"{row['City']}, {row['State']}"
+        try:
+            loc = geocode(query)
+        except Exception:
+            loc = None
+        if loc:
+            merged.at[idx, "Latitude"] = loc.latitude
+            merged.at[idx, "Longitude"] = loc.longitude
+            # write-through cache row by row
+            cache = pd.concat([cache, pd.DataFrame([{
+                "Name": row["Name of Applicant"],
+                "City": row["City"],
+                "State": row["State"],
+                "Latitude": loc.latitude,
+                "Longitude": loc.longitude
+            }])], ignore_index=True)
+        done += 1
+        progress.progress(min(1.0, done / total))
+        time.sleep(0.1)
+
+    # Save cache after batch
+    if len(cache):
+        cache = cache.drop_duplicates(subset=["Name", "City", "State"], keep="last")
+        save_cache(cache)
+
+    # Drop helper columns
+    merged = merged.drop(columns=["Name"], errors="ignore")
+    return merged
+
+
+def color_for_service_counts(ic: int, bmic: int, mibs: int) -> str:
+    only_ic = ic > 0 and bmic == 0 and mibs == 0
+    only_bmic = bmic > 0 and ic == 0 and mibs == 0
+    only_mibs = mibs > 0 and ic == 0 and bmic == 0
+    if only_ic:
+        return "blue"
+    if only_bmic:
+        return "green"
+    if only_mibs:
+        return "purple"
+    if ic + bmic + mibs > 0:
+        return "darkred"
+    return "gray"
+
+
+def construct_form_470_url(app_number) -> Optional[str]:
+    if pd.isna(app_number):
+        return None
     try:
-        current_year = datetime.now().year
-        start_year = current_year - years_back
-        headers = {}
-        app_token = os.getenv("USAC_APP_TOKEN")
-        if app_token:
-            headers["X-App-Token"] = app_token
+        v = int(str(app_number).strip().split(".")[0])
+    except Exception:
+        return None
+    return f"http://legacy.fundsforlearning.com/470/{v}"
 
-        page_size = min(limit, 50000)
-        rows = []
 
-        for year in range(start_year, current_year + 1):
+# -----------------------------------------------------------------------------
+# USAC API fallback (TX + OK) — returns minimally useful C2 inferences
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600)
+def fetch_usac_470(states=("TX", "OK"), years_back=3, limit_per_state=10000) -> pd.DataFrame:
+    headers = {}
+    if USAC_APP_TOKEN:
+        headers["X-App-Token"] = USAC_APP_TOKEN
+
+    now_y = datetime.now().year
+    start_y = now_y - years_back
+
+    rows = []
+    for stus in states:
+        for yr in range(start_y, now_y + 1):
             offset = 0
-            while True:
+            while offset < limit_per_state:
                 params = {
-                    "$limit": page_size,
+                    "$limit": 5000,
                     "$offset": offset,
                     "$select": ",".join([
                         "billed_entity_name",
@@ -68,480 +271,384 @@ def fetch_form_470_api_data(limit=50000, years_back=3, state="TX"):
                         "application_number",
                         "funding_year",
                         "category_one_description",
-                        "category_two_description"
+                        "category_two_description",
                     ]),
-                    "billed_entity_state": state,
-                    "funding_year": year,
+                    "$where": f"billed_entity_state='{stus}' AND funding_year={yr}",
                 }
-                resp = requests.get(FORM_470_API_URL, params=params, headers=headers, timeout=30)
+                try:
+                    resp = requests.get(USAC_470_URL, params=params, headers=headers, timeout=30)
+                except Exception:
+                    break
                 if resp.status_code >= 400:
                     break
                 chunk = resp.json()
                 if not chunk:
                     break
                 rows.extend(chunk)
-                if len(chunk) < page_size:
+                offset += len(chunk)
+                if len(chunk) < 5000:
                     break
-                offset += page_size
 
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return pd.DataFrame()
-
-        output_rows = []
-        for _, r in df.iterrows():
-            name = r.get("billed_entity_name") or "Unknown"
-            city = r.get("billed_entity_city") or ""
-            st_code = r.get("billed_entity_state") or state
-            app_no = r.get("application_number")
-            c1 = r.get("category_one_description")
-            c2 = r.get("category_two_description")
-
-            service_types = []
-            if isinstance(c2, str) and c2.strip():
-                service_types.append("Internal Connections")
-            if isinstance(c1, str) and c1.strip():
-                service_types.append("Data Transmission and/or Internet Access")
-            if not service_types:
-                service_types.append("Unknown")
-
-            for stype in service_types:
-                output_rows.append({
-                    "Name of Applicant": name,
-                    "City": city,
-                    "State": st_code,
-                    "470 App Number": app_no,
-                    "Service Type": stype,
-                    "Function": "",
-                    "Manufacturer": "",
-                })
-
-        out = pd.DataFrame(output_rows)
-        if out.empty:
-            return out
-        return out.dropna(subset=["Name of Applicant"]).drop_duplicates()
-
-    except Exception as e:
-        st.warning(f"Could not fetch Form 470 API data: {str(e)}")
+    if not rows:
         return pd.DataFrame()
 
-# ============================================================================
-# EXISTING HELPER FUNCTIONS
-# ============================================================================
-
-@st.cache_data
-def load_data(uploaded_file):
-    return pd.read_excel(uploaded_file)
-
-def load_cache():
-    if os.path.exists(GEOCODE_CACHE_FILE):
-        try:
-            return pd.read_csv(GEOCODE_CACHE_FILE)
-        except:
-            return pd.DataFrame(columns=['Name', 'City', 'State', 'Latitude', 'Longitude'])
-    return pd.DataFrame(columns=['Name', 'City', 'State', 'Latitude', 'Longitude'])
-
-def save_cache(cache):
-    cache.to_csv(GEOCODE_CACHE_FILE, index=False)
-
-def construct_form_470_url(app_number, funding_year=2025):
-    if pd.isna(app_number):
-        return None
-    try:
-        app_num = int(app_number)
-    except Exception:
-        try:
-            app_num = int(float(app_number))
-        except Exception:
-            return None
-    return f"http://legacy.fundsforlearning.com/470/{app_num}"
-
-def matches_filter(value, filter_list):
-    if not filter_list:
-        return True
-    if pd.isna(value):
-        return False
-    value_lower = str(value).lower()
-    return any(filter_term.lower() in value_lower for filter_term in filter_list)
-
-def geocode_location(name, city, state, cache, geolocator):
-    cached = cache[
-        (cache['Name'] == name) & 
-        (cache['City'] == city) & 
-        (cache['State'] == state)
-    ]
-    if not cached.empty:
-        return cached.iloc[0]['Latitude'], cached.iloc[0]['Longitude']
-    try:
-        search_query = f"{city}, {state}"
-        location = geolocator.geocode(search_query, timeout=10)
-        if location:
-            return location.latitude, location.longitude
-        else:
-            return None, None
-    except:
-        return None, None
-
-def apply_filters(df, function_filters, manufacturer_filters):
-    if not function_filters and not manufacturer_filters:
-        return df
-    if 'Name of Applicant' not in df.columns:
-        return df
-    applicant_groups = df.groupby('Name of Applicant')
-    filtered_applicants = []
-    for applicant_name, group in applicant_groups:
-        function_match = True
-        if function_filters:
-            if 'Function' in group.columns:
-                function_match = group['Function'].apply(lambda x: matches_filter(x, function_filters)).any()
-            else:
-                function_match = False
-        manufacturer_match = True
-        if manufacturer_filters:
-            if 'Manufacturer' in group.columns:
-                manufacturer_match = group['Manufacturer'].apply(lambda x: matches_filter(x, manufacturer_filters)).any()
-            else:
-                manufacturer_match = False
-        if function_match and manufacturer_match:
-            filtered_applicants.append(applicant_name)
-    return df[df['Name of Applicant'].isin(filtered_applicants)].copy()
-
-def aggregate_by_applicant(df):
-    aggregated_data = []
-    if 'Name of Applicant' not in df.columns:
+    raw = pd.DataFrame(rows)
+    if raw.empty:
         return pd.DataFrame()
-    for applicant_name, group in df.groupby('Name of Applicant'):
-        city = group['City'].iloc[0] if 'City' in group.columns else ''
-        state = group['State'].iloc[0] if 'State' in group.columns else ''
-        if 'Service Type' in group.columns:
-            service_counts = group['Service Type'].value_counts().to_dict()
-        else:
-            service_counts = {}
-        ic_count = service_counts.get('Internal Connections', 0)
-        bm_count = service_counts.get('Basic Maintenance of Internal Connections', 0)
-        mb_count = service_counts.get('Managed Internal Broadband Services', 0)
-        dia_count = service_counts.get('Data Transmission and/or Internet Access', 0)
-        app_number = group['470 App Number'].iloc[0] if '470 App Number' in group.columns else None
-        form_url = construct_form_470_url(app_number)
-        functions = group['Function'].dropna().unique().tolist() if 'Function' in group.columns else []
-        manufacturers = group['Manufacturer'].dropna().unique().tolist() if 'Manufacturer' in group.columns else []
-        functions_str = ', '.join([str(f) for f in functions if f]) if functions else ''
-        manufacturers_str = ', '.join([str(m) for m in manufacturers if m]) if manufacturers else ''
-        aggregated_data.append({
-            'Name of Applicant': applicant_name,
-            'City': city,
-            'State': state,
-            '470s_IC': ic_count,
-            '470s_BM': bm_count,
-            '470s_MB': mb_count,
-            '470s_DIA': dia_count,
-            'Form_470_URL': form_url,
-            'Functions': functions_str,
-            'Manufacturers': manufacturers_str
+
+    # Minimal mapping
+    out_rows = []
+    for _, r in raw.iterrows():
+        name = normalize_str(r.get("billed_entity_name"))
+        city = normalize_str(r.get("billed_entity_city"))
+        state = normalize_str(r.get("billed_entity_state"))
+        appno = r.get("application_number")
+        c1 = normalize_str(r.get("category_one_description"))
+        c2 = normalize_str(r.get("category_two_description"))
+
+        # C2 determination
+        ic = 1 if c2 != "" else 0  # treat any c2 text as IC-like opportunity
+        bmic = 0
+        mibs = 0
+
+        out_rows.append({
+            "Name of Applicant": name,
+            "City": city,
+            "State": state,
+            "470 App Number": appno,
+            "IC": ic,
+            "BMIC": bmic,
+            "MIBS": mibs,
+            "Functions": "",
+            "Manufacturers": "",
+            "Source": "USAC",
         })
-    return pd.DataFrame(aggregated_data)
 
-def color_for_services(row):
-    has_ic = row.get('470s_IC', 0) > 0
-    has_bm = row.get('470s_BM', 0) > 0
-    has_mb = row.get('470s_MB', 0) > 0
-    if has_ic and not has_bm and not has_mb:
-        return 'blue'
-    if has_bm and not has_ic and not has_mb:
-        return 'green'
-    if has_mb and not has_ic and not has_bm:
-        return 'purple'
-    if has_ic and has_bm and not has_mb:
-        return 'orange'
-    if has_ic and has_mb and not has_bm:
-        return 'cadetblue'
-    if has_bm and has_mb and not has_ic:
-        return 'lightgreen'
-    if has_ic and has_bm and has_mb:
-        return 'darkred'
-    return 'gray'
+    out = pd.DataFrame(out_rows)
+    out = out.drop_duplicates(subset=["Name of Applicant", "470 App Number"])
+    return out
 
-# ============================================================================
-# MAP / POPUP (470 ONLY)
-# ============================================================================
 
-def create_popup_470_only(row):
-    functions_display = row['Functions'][:150] + '...' if len(row['Functions']) > 150 else row['Functions']
-    manufacturers_display = row['Manufacturers'][:150] + '...' if len(row['Manufacturers']) > 150 else row['Manufacturers']
-    popup_html = f"""
-    <div style="width: 400px; font-family: Arial, sans-serif;">
-        <h3 style="margin: 0 0 10px 0; color: #0066cc;">{row['Name of Applicant']}</h3>
-        <p style="margin: 5px 0;"><b>📍 Location:</b> {row['City']}, TX</p>
-        <hr style="margin: 15px 0; border: 1px solid #ddd;">
-        <h4 style="margin: 10px 0 5px 0; color: #0066cc;">📋 Current Form 470 RFP</h4>
-        <p style="margin: 5px 0;"><b>470s Submitted:</b></p>
-        <ul style="margin: 5px 0; padding-left: 20px; font-size: 13px;">
-            <li>Internal Connections: {int(row['470s_IC'])}</li>
-            <li>Basic Maintenance: {int(row['470s_BM'])}</li>
-            <li>Managed Broadband: {int(row['470s_MB'])}</li>
-            <li>Data/Internet: {int(row['470s_DIA'])}</li>
-        </ul>
-        <p style="margin: 5px 0; font-size: 12px;"><b>Equipment:</b> {functions_display}</p>
-        <p style="margin: 5px 0; font-size: 12px;"><b>Manufacturers:</b> {manufacturers_display}</p>
-        <hr style="margin: 15px 0; border: 1px solid #ddd;">
-        <p style="margin: 5px 0; text-align: center;">
-            <a href="{row['Form_470_URL']}" target="_blank" 
-               style="background-color: #0066cc; color: white; padding: 10px 20px; 
-                      text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold;">
-                📋 View Form 470 RFP →
-            </a>
-        </p>
-    </div>
+# -----------------------------------------------------------------------------
+# Funds For Learning Excel parsing (wide format)
+# -----------------------------------------------------------------------------
+@st.cache_data
+def load_excel_ffl(file) -> pd.DataFrame:
+    # Read without dtype coercion to preserve booleans and strings
+    df = pd.read_excel(file)
+    return df
+
+
+def derive_function_and_manufacturer_columns(df: pd.DataFrame) -> Tuple[Dict[str, List[str]], List[str]]:
     """
-    return popup_html
+    Heuristically identify one-hot columns for C2 subtypes and manufacturers.
+    Returns:
+      func_cols: {"ic": [...], "bmic": [...], "mibs": [...]}
+      mfr_cols: [ ... ]
+    """
+    cols_lower = {c: str(c).lower() for c in df.columns}
 
-def create_map(filtered_df):
-    if len(filtered_df) == 0:
+    # IC-like columns
+    ic_needles = [
+        "wireless", "wi-fi", "wifi", "access point", "ap", "switch", "switches",
+        "router", "firewall", "controller", "ups", "battery", "cabling", "transceiver",
+        "sfp", "optic", "antenna"
+    ]
+    ic_cols = find_columns(df, ic_needles)
+
+    # BMIC columns
+    bmic_cols = find_columns(df, ["basic maintenance", "maintenance"])
+
+    # MIBS columns
+    mibs_cols = find_columns(df, ["managed internal broadband", "mibs", "managed service"])
+
+    # Manufacturer columns: search for known brands and any column that looks like a vendor flag
+    mfr_needles = list(COMMON_MANUFACTURERS) + [
+        "palo alto", "cisco", "meraki", "aruba", "fortinet", "juniper", "ruckus",
+        "ubiquiti", "extreme", "brocade", "arista", "cambium", "aerohive", "hikvision",
+        "tplink", "tp-link", "hewlett", "hewlett packard", "hpe", "hp"
+    ]
+    mfr_cols = find_columns(df, mfr_needles)
+
+    return {"ic": ic_cols, "bmic": bmic_cols, "mibs": mibs_cols}, mfr_cols
+
+
+def parse_ffl_to_c2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform wide FFL export into tidy, C2-only applicant aggregation.
+    Output columns:
+      Name of Applicant, City, State, 470 App Number, IC, BMIC, MIBS, Functions, Manufacturers, Source
+    """
+    # Try to find canonical columns
+    name_col = next((c for c in df.columns if str(c).lower().strip() == "name of applicant"), None)
+    city_col = next((c for c in df.columns if "city" in str(c).lower()), None)
+    state_col = next((c for c in df.columns if "state" in str(c).lower()), None)
+    app_col = next((c for c in df.columns if "470" in str(c).lower() and "number" in str(c).lower()), None)
+
+    if not all([name_col, city_col, state_col, app_col]):
+        st.error("Could not locate required columns (Name of Applicant, City, State, 470 App Number) in the Excel file.")
+        return pd.DataFrame()
+
+    func_cols, mfr_cols = derive_function_and_manufacturer_columns(df)
+
+    out_rows = []
+    for _, r in df.iterrows():
+        name = normalize_str(r.get(name_col))
+        city = normalize_str(r.get(city_col))
+        state = normalize_str(r.get(state_col))
+        appno = r.get(app_col)
+
+        if name == "" or city == "" or state == "" or pd.isna(appno):
+            continue
+
+        ic, bmic, mibs = detect_c2_subtypes_from_row(r, func_cols)
+        # If no C2 present at all, skip row
+        if not (ic or bmic or mibs):
+            continue
+
+        # Gather "function" keywords present for display
+        present_funcs = []
+        for c in func_cols.get("ic", []) + func_cols.get("bmic", []) + func_cols.get("mibs", []):
+            if is_truthy_cell(r.get(c)):
+                present_funcs.append(str(c).replace(".1", "").replace("'", "").strip())
+        present_funcs = sorted(set(present_funcs))
+
+        # Extract manufacturers
+        mfrs = extract_manufacturers_from_row(r, mfr_cols)
+
+        out_rows.append({
+            "Name of Applicant": name,
+            "City": city,
+            "State": state,
+            "470 App Number": appno,
+            "IC": 1 if ic else 0,
+            "BMIC": 1 if bmic else 0,
+            "MIBS": 1 if mibs else 0,
+            "Functions": ", ".join(present_funcs),
+            "Manufacturers": ", ".join(mfrs),
+            "Source": "FFL",
+        })
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(out_rows)
+
+    # Aggregate by applicant + 470 number to count subtypes
+    agg = out.groupby(["Name of Applicant", "City", "State", "470 App Number"], as_index=False).agg({
+        "IC": "sum", "BMIC": "sum", "MIBS": "sum",
+        "Functions": lambda s: ", ".join(sorted(set(", ".join(s).split(", ")))).strip(", "),
+        "Manufacturers": lambda s: ", ".join(sorted(set(", ".join(s).split(", ")))).strip(", "),
+        "Source": lambda s: "FFL"
+    })
+    # Reduce counts to presence flags (>=1)
+    agg["IC"] = (agg["IC"] > 0).astype(int)
+    agg["BMIC"] = (agg["BMIC"] > 0).astype(int)
+    agg["MIBS"] = (agg["MIBS"] > 0).astype(int)
+    return agg
+
+
+# -----------------------------------------------------------------------------
+# Filters and map
+# -----------------------------------------------------------------------------
+def apply_geo_filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    # Keep all OK
+    ok_df = df[df["State"].str.upper() == "OK"].copy()
+
+    # Keep TX north of Waco and west of I-35E
+    tx_df = df[df["State"].str.upper() == "TX"].copy()
+    tx_df = tx_df[(tx_df["Latitude"] > LAT_WACO) & (tx_df["Longitude"] < LON_I35E)]
+
+    # States other than TX/OK are dropped
+    return pd.concat([ok_df, tx_df], ignore_index=True)
+
+
+def build_map(df: pd.DataFrame):
+    if df.empty:
         return None
-    center_lat = filtered_df['Latitude'].mean()
-    center_lon = filtered_df['Longitude'].mean()
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='OpenStreetMap')
-    folium.PolyLine(locations=[[LAT_WACO, -100], [LAT_WACO, -94]], color='red', weight=2, opacity=0.7, popup='Waco Boundary (North)').add_to(m)
-    folium.PolyLine(locations=[[28, LON_I35E], [36, LON_I35E]], color='red', weight=2, opacity=0.7, popup='I-35E Boundary (West)').add_to(m)
-    for _, row in filtered_df.iterrows():
-        color = color_for_services(row)
-        popup_html = create_popup_470_only(row)
+    center_lat = df["Latitude"].mean()
+    center_lon = df["Longitude"].mean()
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
+
+    # Visual reference lines for Waco latitude and I-35E longitude
+    folium.PolyLine(locations=[[LAT_WACO, -106], [LAT_WACO, -93]], color="red", weight=2, opacity=0.5,
+                    popup="Waco latitude cutoff").add_to(m)
+    folium.PolyLine(locations=[[25, LON_I35E], [37, LON_I35E]], color="red", weight=2, opacity=0.5,
+                    popup="I-35E longitude cutoff").add_to(m)
+
+    for _, r in df.iterrows():
+        ic = int(r.get("IC", 0))
+        bmic = int(r.get("BMIC", 0))
+        mibs = int(r.get("MIBS", 0))
+        color = color_for_service_counts(ic, bmic, mibs)
+        name = r["Name of Applicant"]
+        city = r["City"]
+        state = r["State"]
+        fn = r.get("Functions", "")
+        mf = r.get("Manufacturers", "")
+        url = construct_form_470_url(r.get("470 App Number"))
+
+        popup_html = f"""
+        <div style="width: 420px; font-family: Arial, sans-serif;">
+          <h3 style="margin:0 0 8px 0; color:#0e4ca1;">{name}</h3>
+          <p style="margin:0 0 6px 0;">📍 {city}, {state}</p>
+          <ul style="margin:6px 0; padding-left: 18px; font-size: 13px;">
+            <li>IC: <b>{ic}</b> &nbsp; BMIC: <b>{bmic}</b> &nbsp; MIBS: <b>{mibs}</b></li>
+          </ul>
+          <p style="margin:6px 0; font-size: 12px;"><b>Functions:</b> {fn}</p>
+          <p style="margin:6px 0; font-size: 12px;"><b>Manufacturers:</b> {mf}</p>
+          <div style="margin-top:10px; text-align:center;">
+            {"<a href='" + url + "' target='_blank' style='background:#0e4ca1; color:white; padding:8px 14px; text-decoration:none; border-radius:6px;'>View Form 470 →</a>" if url else ""}
+          </div>
+        </div>
+        """
         folium.Marker(
-            location=[row['Latitude'], row['Longitude']],
-            popup=folium.Popup(popup_html, max_width=450),
-            tooltip=f"{row['Name of Applicant']} - Click for details"
+            [r["Latitude"], r["Longitude"]],
+            popup=folium.Popup(popup_html, max_width=460),
+            tooltip=f"{name} — click for details",
         ).add_to(m)
         folium.CircleMarker(
-            location=[row['Latitude'], row['Longitude']],
-            radius=8,
+            [r["Latitude"], r["Longitude"]],
+            radius=7,
             color=color,
             fill=True,
-            fillColor=color,
-            fillOpacity=0.6,
-            weight=2
+            fill_color=color,
+            fill_opacity=0.65,
+            weight=2,
         ).add_to(m)
     return m
 
-# ============================================================================
-# MAIN APPLICATION (470 ONLY)
-# ============================================================================
 
-def main():
-    st.title("📄 Texas E-Rate Opportunity Finder (470 Only)")
-    st.markdown("**470 Source:** Upload Excel or fetch from USAC SODA (beta)")
-    st.markdown("---")
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+st.title("📄 E-Rate Opportunity Finder — TX/OK (Category 2)")
+st.caption("Uploads a Funds For Learning 470 Excel export or uses the USAC API as a fallback. Category 2 only (IC, BMIC, MIBS).")
 
-    with st.sidebar:
-        st.header("📁 Form 470 Source")
-        source_choice = st.radio(
-            "Form 470 Data Source",
-            options=["Upload Excel (recommended)", "USAC 470 API (beta)"],
-            help="Use your Funds for Learning export or fetch basic 470s from USAC API"
-        )
-        uploaded_file = None
-        if source_choice == "Upload Excel (recommended)":
-            uploaded_file = st.file_uploader(
-                "Upload E-Rate Excel File",
-                type=['xls', 'xlsx'],
-                help="Upload your Funds for Learning export file"
-            )
+with st.sidebar:
+    st.header("Data Source")
+    src = st.radio(
+        "Choose source",
+        options=["Upload Excel (recommended)", "USAC API (fallback)"],
+        help="Excel uses detailed Funds For Learning export. API is simplified.",
+    )
+    up = None
+    if src == "Upload Excel (recommended)":
+        up = st.file_uploader("Upload FFL Excel (470 export)", type=["xls", "xlsx"])
 
-        st.markdown("---")
-        st.header("🔍 Form 470 Filters")
-        st.subheader("Equipment Type")
-        function_options = [
-            "Wireless Access Points",
-            "Switches",
-            "Firewall",
-            "Cabling",
-            "UPS/Battery Backup",
-            "Routers",
-            "Wireless Controllers"
-        ]
-        selected_functions = st.multiselect(
-            "Select equipment types (leave empty for all)",
-            function_options,
-            help="Filter by equipment type you sell"
-        )
+    st.divider()
+    st.header("Filters")
 
-        st.subheader("Manufacturers")
-        manufacturer_options = [
-            "Aruba",
-            "Cisco",
-            "Fortinet",
-            "Juniper",
-            "Meraki",
-            "Ruckus",
-            "Ubiquiti",
-            "Extreme Networks"
-        ]
-        selected_manufacturers = st.multiselect(
-            "Select manufacturers (leave empty for all)",
-            manufacturer_options,
-            help="Filter by brands you sell"
-        )
+    # We will populate dynamic filter options after loading data
+    st.markdown("_Filters appear after data loads_")
 
-        st.markdown("---")
-        st.header("🗺️ Territory")
-        st.info(f"**North of:** Waco (Lat {LAT_WACO})\n\n**West of:** I-35E (Lon {LON_I35E})")
+    run_btn = st.button("🚀 Analyze", type="primary", use_container_width=True)
 
-        st.markdown("---")
-        analyze_button = st.button("🚀 Analyze Opportunities", type="primary", use_container_width=True)
+if src == "Upload Excel (recommended)" and up is None and not run_btn:
+    st.info("👈 Upload an Excel file or switch to USAC API fallback.")
+    st.stop()
 
-    if source_choice == "Upload Excel (recommended)" and uploaded_file is None:
-        st.info("👈 Please upload an E-Rate Excel file to get started, or switch to 'USAC 470 API (beta)' to run without a file.")
-        return
+if run_btn:
+    with st.spinner("Processing..."):
+        if src == "Upload Excel (recommended)":
+            raw = load_excel_ffl(up)
+            if raw.empty:
+                st.error("The uploaded Excel appears empty.")
+                st.stop()
+            parsed = parse_ffl_to_c2(raw)
+            if parsed.empty:
+                st.error("No Category 2 opportunities found in the uploaded file.")
+                st.stop()
+        else:
+            parsed = fetch_usac_470()
+            if parsed.empty:
+                st.error("No data returned from USAC API.")
+                st.stop()
 
-    if analyze_button:
-        with st.spinner("🔄 Processing Form 470 data..."):
-            try:
-                # Load Form 470 data
-                if source_choice == "Upload Excel (recommended)":
-                    df = load_data(uploaded_file)
-                else:
-                    df = fetch_form_470_api_data()
+        # Geocode
+        parsed = geocode_bulk(parsed)
+        parsed = parsed.dropna(subset=["Latitude", "Longitude"])
 
-                # Filter to Texas
-                if 'State' in df.columns:
-                    texas_df = df[df['State'] == 'TX'].copy()
-                else:
-                    texas_df = df.copy()
+        # Geo filter (TX north of Waco, west of I-35E; all OK)
+        filtered_geo = apply_geo_filter(parsed)
 
-                if len(texas_df) == 0:
-                    st.error("No Texas applicants found in the 470 data!")
-                    return
+        if filtered_geo.empty:
+            st.warning("No rows remained after geographic filtering.")
+            st.stop()
 
-                # Apply filters
-                if selected_functions or selected_manufacturers:
-                    filtered_texas = apply_filters(texas_df, selected_functions, selected_manufacturers)
-                else:
-                    filtered_texas = texas_df
+        # Dynamic filters for functions and manufacturers
+        all_functions = sorted(set(", ".join(filtered_geo["Functions"].fillna("")).split(", ")))
+        all_functions = [f for f in all_functions if f]  # remove empty
 
-                if len(filtered_texas) == 0:
-                    st.warning("No applicants match your Form 470 filter criteria. Try adjusting your filters.")
-                    return
+        all_manufacturers = sorted(set(", ".join(filtered_geo["Manufacturers"].fillna("")).split(", ")))
+        all_manufacturers = [m for m in all_manufacturers if m]
 
-                # Aggregate by applicant
-                aggregated = aggregate_by_applicant(filtered_texas)
+        # Show filter widgets now that we have options
+        with st.sidebar:
+            st.subheader("Equipment Functions")
+            sel_funcs = st.multiselect("Select equipment functions", options=all_functions, default=[])
 
-                # Geocode
-                cache = load_cache()
-                geolocator = Nominatim(user_agent="texas_erate_webapp_470_only")
-                progress_bar = st.progress(0)
-                latitudes = []
-                longitudes = []
-                for idx, row in aggregated.iterrows():
-                    lat, lon = geocode_location(
-                        row['Name of Applicant'],
-                        row['City'],
-                        row['State'],
-                        cache,
-                        geolocator
-                    )
-                    latitudes.append(lat)
-                    longitudes.append(lon)
-                    if lat is not None and lon is not None:
-                        new_entry = pd.DataFrame([{
-                            'Name': row['Name of Applicant'],
-                            'City': row['City'],
-                            'State': row['State'],
-                            'Latitude': lat,
-                            'Longitude': lon
-                        }])
-                        cache = pd.concat([cache, new_entry], ignore_index=True)
-                        cache = cache.drop_duplicates(subset=['Name', 'City', 'State'], keep='last')
-                    progress_bar.progress((idx + 1) / len(aggregated))
-                    time.sleep(1)
-                save_cache(cache)
+            st.subheader("Manufacturers")
+            sel_mfrs = st.multiselect("Select manufacturers", options=all_manufacturers, default=[])
 
-                aggregated['Latitude'] = latitudes
-                aggregated['Longitude'] = longitudes
-                aggregated = aggregated.dropna(subset=['Latitude', 'Longitude'])
+        # Apply filter logic
+        df = filtered_geo.copy()
+        if sel_funcs:
+            df = df[df["Functions"].apply(lambda s: any(f in str(s) for f in sel_funcs))]
+        if sel_mfrs:
+            df = df[df["Manufacturers"].apply(lambda s: any(m in str(s) for m in sel_mfrs))]
 
-                # Territory filter
-                filtered = aggregated[(aggregated['Latitude'] > LAT_WACO) & (aggregated['Longitude'] < LON_I35E)].copy()
-                if len(filtered) == 0:
-                    st.warning("No applicants found in your territory after geographic filtering.")
-                    return
-
-                st.session_state['results'] = filtered
-                st.success(f"✅ Analysis complete! Found {len(filtered)} opportunities.")
-
-            except Exception as e:
-                st.error(f"Error processing data: {str(e)}")
-                import traceback
-                st.error(traceback.format_exc())
-                return
-
-    if 'results' in st.session_state:
-        filtered = st.session_state['results']
+        if df.empty:
+            st.warning("No rows match your filter choices. Clear filters to see all results.")
+            st.stop()
 
         # Summary metrics
-        col1, col2 = st.columns(2)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Opportunities", len(filtered))
+            st.metric("Opportunities", len(df))
         with col2:
-            ic_count = (filtered['470s_IC'] > 0).sum()
-            st.metric("Internal Connections", ic_count)
+            st.metric("IC", int((df["IC"] > 0).sum()))
+        with col3:
+            st.metric("BMIC", int((df["BMIC"] > 0).sum()))
+        with col4:
+            st.metric("MIBS", int((df["MIBS"] > 0).sum()))
 
-        st.markdown("---")
+        st.divider()
 
-        tab1, tab2 = st.tabs(["🗺️ Interactive Map", "📊 Data Table"])
+        tab1, tab2 = st.tabs(["🗺️ Interactive Map", "📊 Table + Export"])
 
         with tab1:
-            st.subheader("Interactive Map - Click markers for details")
-            map_obj = create_map(filtered)
-            if map_obj:
-                folium_static(map_obj, width=1200, height=600)
-                st.markdown("### 🎨 Service Type Color Legend")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.markdown("🔵 **Blue** = Internal Connections")
-                    st.markdown("🟠 **Orange** = IC + BM")
-                with col2:
-                    st.markdown("🟢 **Green** = Basic Maintenance")
-                    st.markdown("🔷 **Cadet Blue** = IC + MB")
-                with col3:
-                    st.markdown("🟣 **Purple** = Managed Broadband")
-                    st.markdown("🟩 **Light Green** = BM + MB")
-                with col4:
-                    st.markdown("🔴 **Dark Red** = All Three Services")
+            st.subheader("Map — click markers for details")
+            m = build_map(df)
+            if m:
+                folium_static(m, width=1200, height=640)
+                st.markdown("**Legend:** 🔵 IC, 🟢 BMIC, 🟣 MIBS, 🔴 Mixed")
 
         with tab2:
-            st.subheader("Opportunity Details (470 Only)")
-            display_rows = []
-            for _, row in filtered.iterrows():
-                display_rows.append({
-                    'Name of Applicant': row['Name of Applicant'],
-                    'City': row['City'],
-                    '470s_IC': int(row['470s_IC']),
-                    '470s_BM': int(row['470s_BM']),
-                    '470s_MB': int(row['470s_MB']),
-                    '470s_DIA': int(row['470s_DIA']),
-                    'Total_470s': int(row['470s_IC'] + row['470s_BM'] + row['470s_MB'] + row['470s_DIA']),
-                    'Functions': row['Functions'],
-                    'Manufacturers': row['Manufacturers'],
-                    'Form_470_URL': row['Form_470_URL']
-                })
-            display_df = pd.DataFrame(display_rows).sort_values('Total_470s', ascending=False)
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                column_config={
-                    "Form_470_URL": st.column_config.LinkColumn("Form 470 Link")
-                }
-            )
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                display_df.to_excel(writer, index=False, sheet_name='Opportunities')
-            output.seek(0)
-            st.download_button(
-                label="📥 Download 470-Only Excel Report",
-                data=output,
-                file_name="erate_470_only_opportunities.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary"
-            )
+            st.subheader("Results")
+            view = df.copy()
+            # Order columns
+            columns = [
+                "Name of Applicant", "City", "State", "470 App Number",
+                "IC", "BMIC", "MIBS", "Functions", "Manufacturers", "Source",
+                "Latitude", "Longitude"
+            ]
+            for c in columns:
+                if c not in view.columns:
+                    view[c] = ""
+            view = view[columns].sort_values(["State", "City", "Name of Applicant"]).reset_index(drop=True)
 
-if __name__ == "__main__":
-    main()
+            st.dataframe(view, use_container_width=True)
+            out = BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                view.to_excel(writer, index=False, sheet_name="C2 Opportunities")
+            out.seek(0)
+            st.download_button(
+                "📥 Download Excel",
+                data=out,
+                file_name="erate_c2_opportunities_tx_ok.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
