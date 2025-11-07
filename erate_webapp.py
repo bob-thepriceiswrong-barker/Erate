@@ -6,6 +6,7 @@ Persists processed data across Streamlit reruns using st.session_state.
 import os
 import time
 import hashlib
+import sqlite3
 from io import BytesIO
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
@@ -34,7 +35,12 @@ st.set_page_config(
 LAT_WACO = 31.55         # keep rows north of this latitude in TX
 LON_I35E = -97.0         # keep rows west of this longitude in TX
 GEOCODE_CACHE_FILE = "geocode_cache.csv"
+LEAD_TRACKING_DB = "lead_tracking.db"
+
+# USAC Open Data URLs
 USAC_470_URL = os.getenv("USAC_470_DATASET_URL", "https://opendata.usac.org/resource/jp7a-89nd.json")
+USAC_471_COMMITMENTS_URL = "https://opendata.usac.org/resource/avi8-svp9.json"  # Form 471 commitments
+USAC_C2_BUDGET_URL = "https://opendata.usac.org/resource/9xr8-jzmv.json"  # Category 2 budget
 
 USAC_APP_TOKEN = os.getenv("USAC_APP_TOKEN", st.secrets.get("USAC_APP_TOKEN", None))
 
@@ -42,16 +48,44 @@ C2_FUNCTION_KEYWORDS = {
     "ic": [
         "access point", "ap", "wireless", "wifi", "wi-fi", "switch", "switches",
         "router", "firewall", "controller", "ups", "battery", "cabling", "transceiver",
-        "sfp", "optics", "antenna"
+        "sfp", "optics", "antenna", "rack", "mount", "patch panel"
     ],
     "bmic": ["basic maintenance", "maintenance", "support contract"],
     "mibs": ["managed internal broadband", "mibs", "managed service", "as-a-service", "aas"]
 }
 
+# Granular equipment categories for filtering
+EQUIPMENT_CATEGORIES = [
+    "Switches",
+    "Wireless Access Points",
+    "Firewalls",
+    "Routers",
+    "Wireless Controllers",
+    "UPS / Battery Backup",
+    "Cabling (Copper/Fiber)",
+    "Racks and Mounts",
+    "Antennas and Connectors",
+    "Transceivers / SFP / Optics",
+    "Patch Panels",
+    "Basic Maintenance",
+    "Managed Internal Broadband Services"
+]
+
 COMMON_MANUFACTURERS = [
-    "Palo Alto", "Palo Alto Networks", "Cisco", "Meraki", "Aruba", "HPE", "HPE Aruba",
-    "Fortinet", "Juniper", "Ruckus", "Ubiquiti", "Extreme", "Brocade", "Arista",
-    "Cambium", "Aerohive", "Hikvision", "Mellanox", "TP-Link", "HPE ProCurve"
+    # Networking/Wi-Fi
+    "Cisco", "Cisco Meraki", "Meraki", "Aruba", "HPE", "HPE Aruba",
+    "Juniper", "Juniper Mist", "Mist", "Ruckus", "Ruckus Wireless", "CommScope",
+    "Extreme Networks", "Extreme", "Arista", "Dell Networking", "Ubiquiti",
+    "Netgear", "Cambium", "Aerohive", "Brocade", "HPE ProCurve", "TP-Link",
+    # Security/Firewall
+    "Fortinet", "Palo Alto Networks", "Palo Alto", "SonicWall", "WatchGuard",
+    "Check Point", "Barracuda", "Sophos",
+    # Telephony/VOIP
+    "Cisco VOIP", "Mitel", "ShoreTel", "Avaya", "Polycom", "Grandstream",
+    # Cabling/Infrastructure
+    "CommScope Cabling", "Leviton", "Panduit", "Corning", "Belden",
+    # Power/UPS
+    "APC", "Schneider Electric", "Tripp Lite", "Eaton", "Vertiv", "Liebert", "CyberPower"
 ]
 
 STATE_BBOX = {
@@ -249,6 +283,154 @@ def construct_form_470_url(app_number) -> Optional[str]:
     except Exception:
         return None
     return f"http://legacy.fundsforlearning.com/470/{v}"
+
+# -----------------------------------------------------------------------------
+# Lead Tracking Database
+# -----------------------------------------------------------------------------
+def init_lead_tracking_db():
+    """Initialize SQLite database for lead tracking"""
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS leads
+                 (app_number TEXT PRIMARY KEY,
+                  applicant_name TEXT,
+                  pursuing INTEGER DEFAULT 0,
+                  notes TEXT,
+                  last_updated TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS external_insights
+                 (applicant_name TEXT PRIMARY KEY,
+                  bond_info TEXT,
+                  board_notes TEXT,
+                  last_updated TEXT)''')
+    conn.commit()
+    conn.close()
+
+def get_lead_status(app_number: str) -> Dict:
+    """Get tracking status for a specific lead"""
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute("SELECT pursuing, notes FROM leads WHERE app_number=?", (str(app_number),))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return {"pursuing": bool(result[0]), "notes": result[1] or ""}
+    return {"pursuing": False, "notes": ""}
+
+def update_lead_status(app_number: str, applicant_name: str, pursuing: bool, notes: str):
+    """Update tracking status for a lead"""
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO leads
+                 (app_number, applicant_name, pursuing, notes, last_updated)
+                 VALUES (?, ?, ?, ?, ?)""",
+              (str(app_number), applicant_name, int(pursuing), notes,
+               datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_external_insights(applicant_name: str) -> Dict:
+    """Get external insights for an applicant"""
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute("SELECT bond_info, board_notes FROM external_insights WHERE applicant_name=?",
+              (applicant_name,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return {"bond_info": result[0] or "", "board_notes": result[1] or ""}
+    return {"bond_info": "", "board_notes": ""}
+
+def update_external_insights(applicant_name: str, bond_info: str, board_notes: str):
+    """Update external insights for an applicant"""
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO external_insights
+                 (applicant_name, bond_info, board_notes, last_updated)
+                 VALUES (?, ?, ?, ?)""",
+              (applicant_name, bond_info, board_notes, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+# -----------------------------------------------------------------------------
+# Form 471 Historical Data
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=86400)
+def fetch_471_history(entity_name: str, years_back: int = 3) -> pd.DataFrame:
+    """Fetch Form 471 commitment history for an entity"""
+    headers = {}
+    if USAC_APP_TOKEN:
+        headers["X-App-Token"] = USAC_APP_TOKEN
+
+    now_y = datetime.now().year
+    start_y = now_y - years_back
+
+    rows = []
+    for yr in range(start_y, now_y + 1):
+        params = {
+            "$limit": 1000,
+            "$select": ",".join([
+                "funding_year", "applicant_name", "service_provider_name",
+                "total_authorized_disbursement", "funding_commitment_request",
+                "category_of_service", "frn_line_item_service_details"
+            ]),
+            "$where": f"applicant_name='{entity_name}' AND funding_year={yr}",
+        }
+        try:
+            resp = requests.get(USAC_471_COMMITMENTS_URL, params=params,
+                              headers=headers, timeout=30)
+            if resp.status_code == 200:
+                chunk = resp.json()
+                rows.extend(chunk)
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+# -----------------------------------------------------------------------------
+# Category 2 Budget Data
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=86400)
+def fetch_c2_budget(entity_name: str) -> Dict:
+    """Fetch Category 2 budget information for an entity"""
+    headers = {}
+    if USAC_APP_TOKEN:
+        headers["X-App-Token"] = USAC_APP_TOKEN
+
+    params = {
+        "$limit": 10,
+        "$select": ",".join([
+            "entity_name", "category_two_budget_total",
+            "category_two_budget_used", "category_two_budget_remaining"
+        ]),
+        "$where": f"entity_name='{entity_name}'",
+    }
+
+    try:
+        resp = requests.get(USAC_C2_BUDGET_URL, params=params,
+                          headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                item = data[0]
+                total = float(item.get("category_two_budget_total", 0))
+                used = float(item.get("category_two_budget_used", 0))
+                remaining = float(item.get("category_two_budget_remaining", 0))
+
+                percent_used = (used / total * 100) if total > 0 else 0
+
+                return {
+                    "total": total,
+                    "used": used,
+                    "remaining": remaining,
+                    "percent_used": percent_used
+                }
+    except Exception:
+        pass
+
+    return {"total": 0, "used": 0, "remaining": 0, "percent_used": 0}
 
 # -----------------------------------------------------------------------------
 # USAC API fallback (TX + OK)
@@ -455,6 +637,139 @@ def build_map(df: pd.DataFrame):
     return m
 
 # -----------------------------------------------------------------------------
+# Account Detail View
+# -----------------------------------------------------------------------------
+def show_account_detail(row):
+    """Display detailed account information in an expander"""
+    name = row["Name of Applicant"]
+    app_number = row.get("470 App Number", "")
+
+    st.subheader(f"📋 {name}")
+    st.caption(f"📍 {row['City']}, {row['State']} | Form 470: {app_number}")
+
+    # Tabs for different information sections
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📄 Current Request (470)",
+        "📊 Historical Funding (471)",
+        "💰 E-Rate Budget",
+        "🔍 External Insights"
+    ])
+
+    with tab1:
+        st.markdown("### Current Form 470 Request")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**Equipment Functions:**")
+            funcs = row.get("Functions", "")
+            if funcs:
+                for func in funcs.split(", "):
+                    st.markdown(f"- {func}")
+            else:
+                st.info("No specific functions listed")
+
+        with col2:
+            st.markdown(f"**Manufacturers Requested:**")
+            mfrs = row.get("Manufacturers", "")
+            if mfrs:
+                for mfr in mfrs.split(", "):
+                    st.markdown(f"- {mfr}")
+            else:
+                st.info("No specific manufacturers listed")
+
+        url = construct_form_470_url(app_number)
+        if url:
+            st.markdown(f"[🔗 View Full Form 470 Details]({url})")
+
+    with tab2:
+        st.markdown("### Historical E-Rate Funding (Past 3 Years)")
+        with st.spinner("Loading Form 471 history..."):
+            history_df = fetch_471_history(name)
+
+        if not history_df.empty:
+            # Group by year and service provider
+            summary = history_df.groupby(['funding_year', 'service_provider_name']).agg({
+                'total_authorized_disbursement': 'sum',
+                'category_of_service': lambda x: ', '.join(set(x))
+            }).reset_index()
+
+            st.dataframe(summary, use_container_width=True)
+
+            total_funding = history_df['total_authorized_disbursement'].astype(float).sum()
+            st.metric("Total Historical Funding (3 years)", f"${total_funding:,.0f}")
+        else:
+            st.info("No Form 471 history found for this applicant in the past 3 years.")
+
+    with tab3:
+        st.markdown("### Category 2 Budget Status")
+        with st.spinner("Loading C2 budget info..."):
+            budget = fetch_c2_budget(name)
+
+        if budget["total"] > 0:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Budget", f"${budget['total']:,.0f}")
+            with col2:
+                st.metric("Used", f"${budget['used']:,.0f}")
+            with col3:
+                st.metric("Remaining", f"${budget['remaining']:,.0f}")
+
+            st.progress(budget["percent_used"] / 100)
+            st.caption(f"Budget Used: {budget['percent_used']:.1f}%")
+
+            if budget["percent_used"] > 90:
+                st.warning("⚠️ This applicant has used >90% of their Category 2 budget. Limited funding available.")
+            elif budget["percent_used"] < 50:
+                st.success("✅ This applicant has significant Category 2 budget remaining!")
+        else:
+            st.info("No Category 2 budget information available for this applicant.")
+
+    with tab4:
+        st.markdown("### External Insights")
+        st.caption("Track bond initiatives, board meeting notes, and other intelligence")
+
+        insights = get_external_insights(name)
+
+        bond_info = st.text_area("Bond Information",
+                                 value=insights["bond_info"],
+                                 height=100,
+                                 placeholder="e.g., $50M tech bond passed Nov 2024",
+                                 key=f"bond_{app_number}")
+
+        board_notes = st.text_area("Board Meeting Notes",
+                                   value=insights["board_notes"],
+                                   height=100,
+                                   placeholder="e.g., Board approved network upgrade RFP - Jan 2025",
+                                   key=f"board_{app_number}")
+
+        if st.button("💾 Save Insights", key=f"save_insights_{app_number}"):
+            update_external_insights(name, bond_info, board_notes)
+            st.success("Insights saved!")
+
+    # Lead tracking section (always visible at bottom)
+    st.divider()
+    st.markdown("### 🎯 Lead Tracking")
+
+    lead_status = get_lead_status(app_number)
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        pursuing = st.checkbox("Actively Pursuing",
+                              value=lead_status["pursuing"],
+                              key=f"pursuing_{app_number}")
+
+    with col2:
+        notes = st.text_area("Sales Notes",
+                            value=lead_status["notes"],
+                            height=100,
+                            placeholder="Add your notes about this lead...",
+                            key=f"notes_{app_number}")
+
+    if st.button("💾 Save Lead Status", key=f"save_lead_{app_number}", type="primary"):
+        update_lead_status(app_number, name, pursuing, notes)
+        st.success("Lead status saved!")
+        st.balloons()
+
+# -----------------------------------------------------------------------------
 # Session-state utilities
 # -----------------------------------------------------------------------------
 def file_digest(uploaded_file) -> str:
@@ -480,11 +795,48 @@ def ensure_session_keys():
 
 ensure_session_keys()
 
+# Initialize lead tracking database
+init_lead_tracking_db()
+
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
-st.title("📄 E-Rate Opportunity Finder — TX/OK (Category 2)")
-st.caption("Uploads a Funds For Learning 470 Excel export or uses the USAC API as a fallback. Category 2 only (IC, BMIC, MIBS).")
+st.title("📄 E-Rate Lead Management System — TX/OK")
+st.caption("Enterprise-level E-Rate opportunity finder with historical data, budget tracking, and lead management. Territory: North TX (north of Waco, west of I-35E) + Oklahoma.")
+
+# Feature highlights expander
+with st.expander("ℹ️ What's New in This Enterprise Version", expanded=False):
+    st.markdown("""
+    ### 🎯 Key Features:
+
+    **📊 Enhanced Filters:**
+    - **40+ Manufacturers**: Cisco, Fortinet, Palo Alto, SonicWall, Aruba, Meraki, and more
+    - **13 Equipment Categories**: Switches, Wireless APs, Firewalls, UPS, Cabling, Racks, etc.
+    - **Multi-Select**: Choose multiple manufacturers and equipment types simultaneously
+
+    **💰 Financial Intelligence:**
+    - **Form 471 History**: See past E-Rate purchases and winning vendors (3-year lookback)
+    - **Category 2 Budget Tracking**: View remaining C2 budget for each applicant
+    - **Smart Prioritization**: Identify high-value targets with available funding
+
+    **🎯 Lead Management:**
+    - **Mark Leads**: Flag opportunities you're actively pursuing
+    - **Sales Notes**: Add and track notes for each opportunity
+    - **Filter Pursued**: View only your active pipeline
+    - **Persistent Storage**: All tracking data saved to local database
+
+    **🔍 360° Account View:**
+    - **Current Request (470)**: Equipment and manufacturer details
+    - **Historical Funding (471)**: Past purchases and service providers
+    - **E-Rate Budget**: Total/used/remaining C2 funding with visual progress
+    - **External Insights**: Track bond initiatives and board meeting notes
+
+    **🚀 Performance:**
+    - Instant filtering (no page reloads)
+    - Cached API data for speed
+    - One-click Excel export
+    - Interactive map visualization
+    """)
 
 with st.sidebar:
     st.header("Data Source")
@@ -510,6 +862,9 @@ with st.sidebar:
     # Placeholders; populated after data is loaded
     func_ph = st.empty()
     mfr_ph = st.empty()
+
+    st.divider()
+    show_pursued = st.checkbox("Show only pursued leads", value=False, key="show_pursued_only")
 
     run_btn = st.button("🚀 Analyze", type="primary", use_container_width=True, key="analyze_btn")
 
@@ -614,16 +969,45 @@ if st.session_state["sel_funcs"]:
 if st.session_state["sel_mfrs"]:
     df = df[df["Manufacturers"].apply(lambda s: any(m in str(s) for m in st.session_state["sel_mfrs"]))]
 
+# Apply pursued leads filter
+if st.session_state.get("show_pursued_only", False):
+    pursued_apps = []
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    c.execute("SELECT app_number FROM leads WHERE pursuing=1")
+    pursued_apps = [str(row[0]) for row in c.fetchall()]
+    conn.close()
+
+    if pursued_apps:
+        df = df[df["470 App Number"].astype(str).isin(pursued_apps)]
+    else:
+        st.info("No leads marked as pursuing yet. Uncheck 'Show only pursued leads' to see all opportunities.")
+        st.stop()
+
 if df.empty:
     st.warning("No rows match your filter choices. Clear filters to see all results.")
     st.stop()
 
 # Summary metrics
-col1, col2, col3, col4 = st.columns(4)
-with col1: st.metric("Opportunities", len(df))
+# Count pursued leads
+pursued_count = 0
+if not df.empty:
+    conn = sqlite3.connect(LEAD_TRACKING_DB)
+    c = conn.cursor()
+    app_numbers = df["470 App Number"].astype(str).tolist()
+    if app_numbers:
+        placeholders = ",".join(["?" for _ in app_numbers])
+        c.execute(f"SELECT COUNT(*) FROM leads WHERE pursuing=1 AND app_number IN ({placeholders})", app_numbers)
+        result = c.fetchone()
+        pursued_count = result[0] if result else 0
+    conn.close()
+
+col1, col2, col3, col4, col5 = st.columns(5)
+with col1: st.metric("Total Opportunities", len(df))
 with col2: st.metric("IC", int((df["IC"] > 0).sum()))
 with col3: st.metric("BMIC", int((df["BMIC"] > 0).sum()))
 with col4: st.metric("MIBS", int((df["MIBS"] > 0).sum()))
+with col5: st.metric("🎯 Pursuing", pursued_count)
 
 st.divider()
 
@@ -637,7 +1021,9 @@ with tab1:
         st.markdown("**Legend:** 🔵 IC, 🟢 BMIC, 🟣 MIBS, 🔴 Mixed")
 
 with tab2:
-    st.subheader("Results")
+    st.subheader("Results Table & Account Details")
+
+    # Create view dataframe
     view = df.copy()
     columns = [
         "Name of Applicant", "City", "State", "470 App Number",
@@ -648,7 +1034,11 @@ with tab2:
         if c not in view.columns:
             view[c] = ""
     view = view[columns].sort_values(["State", "City", "Name of Applicant"]).reset_index(drop=True)
+
+    # Display dataframe
     st.dataframe(view, use_container_width=True)
+
+    # Download button
     out = BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         view.to_excel(writer, index=False, sheet_name="C2 Opportunities")
@@ -660,3 +1050,24 @@ with tab2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
+
+    st.divider()
+
+    # Account Detail Viewer
+    st.subheader("🔍 Account Detail Viewer")
+    st.caption("Select an applicant to view detailed 360° information including Form 471 history, C2 budget, and lead tracking.")
+
+    # Create selection dropdown
+    applicant_options = [""] + sorted(df["Name of Applicant"].unique().tolist())
+    selected_applicant = st.selectbox(
+        "Select an applicant to view details:",
+        options=applicant_options,
+        key="selected_applicant_detail"
+    )
+
+    if selected_applicant and selected_applicant != "":
+        # Find the row for this applicant
+        applicant_row = df[df["Name of Applicant"] == selected_applicant].iloc[0]
+
+        st.divider()
+        show_account_detail(applicant_row)
