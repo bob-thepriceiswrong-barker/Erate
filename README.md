@@ -4,7 +4,33 @@ Advanced E-Rate opportunity finder with historical data, budget tracking, and co
 
 **Territory:** North Texas (north of Waco, west of I-35E) + Oklahoma
 
-## 🚀 Access the App
+## 🚀 Running the Application
+
+### Option 1: Combined App (Recommended) ⭐
+
+Run both tools in one unified application:
+
+```bash
+streamlit run erate_combined_app.py
+```
+
+Use the sidebar to switch between:
+- **🎯 Lead Management System** - Full territory management with lead tracking
+- **🎓 USAC Data Viewer** - Direct API access for custom queries
+
+### Option 2: Individual Apps
+
+Run each app separately:
+
+```bash
+# Lead Management System
+streamlit run erate_webapp.py
+
+# USAC Data Viewer
+streamlit run usac_data_viewer.py
+```
+
+## 🌐 Live Deployment
 
 **Live App:** https://YOUR-APP-URL.streamlit.app
 
