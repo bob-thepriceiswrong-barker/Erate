@@ -63,9 +63,10 @@ if app_mode == "🎯 Lead Management System":
     GEOCODE_CACHE_FILE = "geocode_cache.csv"
     LEAD_TRACKING_DB = "lead_tracking.db"
 
+    # USAC Open Data URLs - All use SODA2 (Form 470 dataset doesn't support SODA3)
     USAC_470_URL = os.getenv("USAC_470_DATASET_URL", "https://opendata.usac.org/resource/jp7a-89nd.json")
-    USAC_471_COMMITMENTS_URL = "https://opendata.usac.org/resource/avi8-svp9.json"
-    USAC_C2_BUDGET_URL = "https://opendata.usac.org/resource/9xr8-jzmv.json"
+    USAC_471_COMMITMENTS_URL = "https://opendata.usac.org/resource/avi8-svp9.json"  # Form 471 commitments
+    USAC_C2_BUDGET_URL = "https://opendata.usac.org/resource/9xr8-jzmv.json"  # Category 2 budget
 
     C2_FUNCTION_KEYWORDS = {
         "ic": [
@@ -445,7 +446,7 @@ if app_mode == "🎯 Lead Management System":
                             "application_number","funding_year",
                             "category_one_description","category_two_description",
                         ]),
-                        "$where": f"billed_entity_state='{stus}' AND funding_year={yr}",
+                        "$where": f"billed_entity_state='{stus}' AND funding_year='{yr}'",
                     }
                     try:
                         resp = requests.get(USAC_470_URL, params=params, headers=headers, timeout=30)

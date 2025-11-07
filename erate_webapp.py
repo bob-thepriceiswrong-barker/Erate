@@ -37,7 +37,7 @@ LON_I35E = -97.0         # keep rows west of this longitude in TX
 GEOCODE_CACHE_FILE = "geocode_cache.csv"
 LEAD_TRACKING_DB = "lead_tracking.db"
 
-# USAC Open Data URLs
+# USAC Open Data URLs - All use SODA2 (Form 470 dataset doesn't support SODA3)
 USAC_470_URL = os.getenv("USAC_470_DATASET_URL", "https://opendata.usac.org/resource/jp7a-89nd.json")
 USAC_471_COMMITMENTS_URL = "https://opendata.usac.org/resource/avi8-svp9.json"  # Form 471 commitments
 USAC_C2_BUDGET_URL = "https://opendata.usac.org/resource/9xr8-jzmv.json"  # Category 2 budget
@@ -438,7 +438,7 @@ def fetch_c2_budget(entity_name: str) -> Dict:
     return {"total": 0, "used": 0, "remaining": 0, "percent_used": 0}
 
 # -----------------------------------------------------------------------------
-# USAC API fallback (TX + OK)
+# USAC API fallback (TX + OK) - Uses SODA2 (Form 470 doesn't support SODA3)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_usac_470(states=("TX", "OK"), years_back=3, limit_per_state=10000) -> pd.DataFrame:
@@ -462,7 +462,7 @@ def fetch_usac_470(states=("TX", "OK"), years_back=3, limit_per_state=10000) -> 
                         "application_number","funding_year",
                         "category_one_description","category_two_description",
                     ]),
-                    "$where": f"billed_entity_state='{stus}' AND funding_year={yr}",
+                    "$where": f"billed_entity_state='{stus}' AND funding_year='{yr}'",
                 }
                 try:
                     resp = requests.get(USAC_470_URL, params=params, headers=headers, timeout=30)
