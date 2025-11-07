@@ -42,7 +42,12 @@ USAC_470_URL = os.getenv("USAC_470_DATASET_URL", "https://opendata.usac.org/reso
 USAC_471_COMMITMENTS_URL = "https://opendata.usac.org/resource/avi8-svp9.json"  # Form 471 commitments
 USAC_C2_BUDGET_URL = "https://opendata.usac.org/resource/9xr8-jzmv.json"  # Category 2 budget
 
-USAC_APP_TOKEN = os.getenv("USAC_APP_TOKEN", st.secrets.get("USAC_APP_TOKEN", None))
+# Try to get app token from environment or secrets, fallback to default
+try:
+    USAC_APP_TOKEN = os.getenv("USAC_APP_TOKEN") or st.secrets.get("USAC_APP_TOKEN", None)
+except:
+    # Use default app token if not found in environment or secrets
+    USAC_APP_TOKEN = "MFa7tcJ2Pybss1tK93iriT9qW"
 
 C2_FUNCTION_KEYWORDS = {
     "ic": [
