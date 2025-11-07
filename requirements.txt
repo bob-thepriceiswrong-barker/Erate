@@ -1,9 +1,14 @@
-streamlit
-pandas
-openpyxl
-folium
-streamlit-folium
-geopy
-requests
-fuzzywuzzy
-python-Levenshtein
+# Core Streamlit and data processing
+streamlit>=1.28.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# For E-Rate Lead Management System (erate_webapp.py)
+folium>=0.14.0
+streamlit-folium>=0.13.0
+geopy>=2.3.0
+fuzzywuzzy>=0.18.0
+python-Levenshtein>=0.21.0
+
+# API and HTTP requests (both apps)
+requests>=2.31.0

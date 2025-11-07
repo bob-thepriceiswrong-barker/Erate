@@ -29,5 +29,12 @@ geocode_cache.csv
 lead_tracking.db
 *.log
 
+# Data exports (from usac_data_viewer.py)
+# Uncomment if you don't want to track exported data files
+# *.csv
+# *.xlsx
+# *.json
+
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/
