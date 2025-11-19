@@ -103,6 +103,41 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     }
     return df.rename(columns=final_map)
 
+def _alias_map():
+    # Keep in sync with normalize_columns
+    return {
+        "name of applicant": ["name of applicant", "applicant name", "ben name", "entity", "district"],
+        "city": ["city", "city/town", "applicant city"],
+        "state": ["state", "st", "applicant state"],
+        "470 app number": ["470 app number", "form 470 number", "470 number", "470#", "application number"],
+        "service type": ["service type", "service type (470)", "category", "category of service"],
+        "function": ["function", "equipment", "equipment type", "product function"],
+        "manufacturer": ["manufacturer", "brand", "vendor/brand", "make"],
+    }
+
+def detect_columns(uploaded_file) -> dict:
+    """Read header only and map actual column names to canonical keys."""
+    header_only = pd.read_excel(uploaded_file, nrows=0)
+    raw_cols = list(header_only.columns)
+    norm = {c: str(c).strip().lower() for c in raw_cols}
+    aliases = _alias_map()
+    actual = {}
+    for canonical, alts in aliases.items():
+        found = next((orig for orig in raw_cols if norm[orig] in alts), None)
+        if found:
+            actual[canonical] = found
+    return actual
+
+@st.cache_data
+def preview_states(uploaded_file, state_actual_col: str) -> list:
+    """Read only the State column to list available states quickly."""
+    if not state_actual_col:
+        return []
+    s = pd.read_excel(uploaded_file, usecols=[state_actual_col])[state_actual_col]
+    s = s.dropna().astype(str).str.upper().str.strip()
+    # Keep 2-letter U.S. state codes
+    return sorted(s[s.str.len() == 2].unique().tolist())
+
 def load_cache():
     if os.path.exists(GEOCODE_CACHE_FILE):
         try:
@@ -326,6 +361,22 @@ def main():
             type=['xls', 'xlsx'],
         )
 
+        # State selector (fast preview without loading full file)
+        selected_states = []
+        alias_map = {}
+        available_states = []
+        if uploaded_file is not None:
+            alias_map = detect_columns(uploaded_file)
+            state_actual = alias_map.get("state")
+            available_states = preview_states(uploaded_file, state_actual) if state_actual else []
+            default_states = [s for s in ["TX", "OK"] if s in available_states] or available_states[:2]
+            selected_states = st.multiselect(
+                "States to include",
+                options=available_states,
+                default=default_states,
+                help="Filter by state before processing to speed things up"
+            )
+
         st.markdown("---")
         st.header("🔍 Filters")
 
@@ -352,14 +403,29 @@ def main():
     if analyze_button:
         with st.spinner("🔄 Processing Form 470 data..."):
             try:
-                df = load_data(uploaded_file)
+                # Detect actual column names and build minimal usecols
+                usecols = []
+                for key in ["name of applicant", "city", "state", "service type",
+                            "470 app number", "function", "manufacturer"]:
+                    col = alias_map.get(key)
+                    if col:
+                        usecols.append(col)
+
+                if not usecols:
+                    st.error("Could not detect required columns in the uploaded file. Please verify your export.")
+                    return
+
+                # Read only needed columns (faster), then normalize
+                df = pd.read_excel(uploaded_file, usecols=usecols)
                 df = normalize_columns(df)
 
-                # Keep only TX and OK
-                if 'State' not in df.columns:
-                    st.error("The uploaded file must include a 'State' column.")
+                # Early state filter (fast)
+                if selected_states:
+                    df = df[df["State"].isin(selected_states)].copy()
+
+                if len(df) == 0:
+                    st.warning("No rows match your state selection.")
                     return
-                df = df[df['State'].isin(TARGET_STATES)].copy()
 
                 # Optional service type pre-filter
                 if selected_service_types and 'Service Type' in df.columns:
